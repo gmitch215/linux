@@ -36,16 +36,21 @@ v3d_init_core(struct v3d_dev *v3d, int core)
 	V3D_CORE_WRITE(core, V3D_CTL_L2TFLEND, ~0);
 }
 
-/* Sets invariant state for the HW. */
-static void
-v3d_init_hw_state(struct v3d_dev *v3d)
-{
-	v3d_init_core(v3d, 0);
-}
-
-static void
+void
 v3d_idle_axi(struct v3d_dev *v3d, int core)
 {
+	if (v3d->ver >= V3D_GEN_71) {
+		V3D_WRITE(V3D_GMP_CFG(v3d->ver), V3D_GMP_CFG_STOP_REQ);
+
+		if (wait_for((V3D_READ(V3D_GMP_STATUS(v3d->ver)) &
+			      (V3D_GMP_STATUS_RD_COUNT_MASK |
+			       V3D_GMP_STATUS_WR_COUNT_MASK |
+			       V3D_GMP_STATUS_CFG_BUSY)) == 0, 100)) {
+			drm_err(&v3d->drm, "Failed to wait for safe GMP shutdown\n");
+		}
+		return;
+	}
+
 	V3D_CORE_WRITE(core, V3D_GMP_CFG(v3d->ver), V3D_GMP_CFG_STOP_REQ);
 
 	if (wait_for((V3D_CORE_READ(core, V3D_GMP_STATUS(v3d->ver)) &
@@ -56,7 +61,7 @@ v3d_idle_axi(struct v3d_dev *v3d, int core)
 	}
 }
 
-static void
+void
 v3d_idle_gca(struct v3d_dev *v3d)
 {
 	if (v3d->ver >= V3D_GEN_41)
@@ -144,7 +149,8 @@ v3d_reset(struct v3d_dev *v3d)
 	v3d_mmu_set_page_table(v3d);
 	v3d_irq_reset(v3d);
 
-	v3d_perfmon_stop(v3d, v3d->active_perfmon, false);
+	/* Re-arm the global perfmon HW counters that the reset zeroed. */
+	v3d_perfmon_resume(v3d);
 
 	trace_v3d_reset_end(dev);
 }
@@ -267,6 +273,13 @@ v3d_invalidate_caches(struct v3d_dev *v3d)
 	v3d_invalidate_slices(v3d, 0);
 }
 
+/* Sets invariant state for the HW. */
+void
+v3d_init_hw_state(struct v3d_dev *v3d)
+{
+	v3d_init_core(v3d, 0);
+}
+
 static void
 v3d_huge_mnt_init(struct v3d_dev *v3d)
 {
@@ -295,27 +308,31 @@ v3d_gem_init(struct drm_device *dev)
 	for (i = 0; i < V3D_MAX_QUEUES; i++) {
 		struct v3d_queue_state *queue = &v3d->queue[i];
 
+		queue->stats = v3d_stats_alloc();
+		if (!queue->stats) {
+			ret = -ENOMEM;
+			goto err_stats;
+		}
+
 		queue->fence_context = dma_fence_context_alloc(1);
-		memset(&queue->stats, 0, sizeof(queue->stats));
-		seqcount_init(&queue->stats.lock);
 
 		spin_lock_init(&queue->queue_lock);
-		spin_lock_init(&queue->fence_lock);
 	}
 
 	spin_lock_init(&v3d->mm_lock);
+	spin_lock_init(&v3d->perfmon_state.lock);
 	ret = drmm_mutex_init(dev, &v3d->bo_lock);
 	if (ret)
-		return ret;
+		goto err_stats;
 	ret = drmm_mutex_init(dev, &v3d->reset_lock);
 	if (ret)
-		return ret;
+		goto err_stats;
 	ret = drmm_mutex_init(dev, &v3d->sched_lock);
 	if (ret)
-		return ret;
+		goto err_stats;
 	ret = drmm_mutex_init(dev, &v3d->cache_clean_lock);
 	if (ret)
-		return ret;
+		goto err_stats;
 
 	/* Note: We don't allocate address 0.  Various bits of HW
 	 * treat 0 as special, such as the occlusion query counters
@@ -327,26 +344,29 @@ v3d_gem_init(struct drm_device *dev)
 			       &v3d->pt_paddr,
 			       GFP_KERNEL | __GFP_NOWARN | __GFP_ZERO);
 	if (!v3d->pt) {
-		drm_mm_takedown(&v3d->mm);
 		dev_err(v3d->drm.dev,
 			"Failed to allocate page tables. Please ensure you have DMA enabled.\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_dma_alloc;
 	}
-
-	v3d_init_hw_state(v3d);
-	v3d_mmu_set_page_table(v3d);
 
 	v3d_huge_mnt_init(v3d);
 
 	ret = v3d_sched_init(v3d);
-	if (ret) {
-		drm_mm_takedown(&v3d->mm);
-		dma_free_coherent(v3d->drm.dev, pt_size, (void *)v3d->pt,
-				  v3d->pt_paddr);
-		return ret;
-	}
+	if (ret)
+		goto err_sched;
 
 	return 0;
+
+err_sched:
+	dma_free_coherent(v3d->drm.dev, pt_size, (void *)v3d->pt, v3d->pt_paddr);
+err_dma_alloc:
+	drm_mm_takedown(&v3d->mm);
+err_stats:
+	for (i--; i >= 0; i--)
+		v3d_stats_put(v3d->queue[i].stats);
+
+	return ret;
 }
 
 void
@@ -360,8 +380,13 @@ v3d_gem_destroy(struct drm_device *dev)
 	/* Waiting for jobs to finish would need to be done before
 	 * unregistering V3D.
 	 */
-	for (q = 0; q < V3D_MAX_QUEUES; q++)
+	for (q = 0; q < V3D_MAX_QUEUES; q++) {
 		WARN_ON(v3d->queue[q].active_job);
+		v3d_stats_put(v3d->queue[q].stats);
+		dma_fence_put(v3d->perfmon_state.last_hw_fence[q]);
+	}
+
+	dma_fence_put(v3d->perfmon_state.fence);
 
 	drm_mm_takedown(&v3d->mm);
 

@@ -17,6 +17,7 @@
 #include <linux/refcount.h>
 #include <linux/percpu-refcount.h>
 #include <linux/percpu-rwsem.h>
+#include <linux/sched.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/workqueue.h>
 #include <linux/bpf-cgroup-defs.h>
@@ -167,6 +168,7 @@ struct cgroup_file {
 	struct kernfs_node *kn;
 	unsigned long notified_at;
 	struct timer_list notify_timer;
+	spinlock_t lock;
 };
 
 /*
@@ -250,6 +252,18 @@ struct cgroup_subsys_state {
 	 * Protected by cgroup_mutex.
 	 */
 	int nr_descendants;
+
+	/*
+	 * Hierarchical populated state. For cgroup->self, nr_populated_csets
+	 * counts populated csets linked via cgrp_cset_link.
+	 * nr_populated_children counts immediate-child csses whose own
+	 * populated state is nonzero. Protected by css_set_lock.
+	 */
+	int nr_populated_csets;
+	int nr_populated_children;
+
+	/* deferred kill_css_finish() queued by css_update_populated() */
+	struct work_struct kill_finish_work;
 
 	/*
 	 * A singly-linked list of css structures to be rstat flushed.
@@ -502,23 +516,21 @@ struct cgroup {
 	int max_descendants;
 
 	/*
-	 * Each non-empty css_set associated with this cgroup contributes
-	 * one to nr_populated_csets.  The counter is zero iff this cgroup
-	 * doesn't have any tasks.
-	 *
-	 * All children which have non-zero nr_populated_csets and/or
-	 * nr_populated_children of their own contribute one to either
-	 * nr_populated_domain_children or nr_populated_threaded_children
-	 * depending on their type.  Each counter is zero iff all cgroups
-	 * of the type in the subtree proper don't have any tasks.
+	 * Domain/threaded split of self.nr_populated_children: each counts
+	 * immediate-child cgroups whose subtree is populated and sums to
+	 * self.nr_populated_children. Kept as separate fields to allow readers
+	 * like cgroup_can_be_thread_root() unlocked access. Protected by
+	 * css_set_lock; updated by css_update_populated().
 	 */
-	int nr_populated_csets;
 	int nr_populated_domain_children;
 	int nr_populated_threaded_children;
 
 	int nr_threaded_children;	/* # of live threaded child cgroups */
 
-	/* sequence number for cgroup.kill, serialized by css_set_lock. */
+	/*
+	 * Sequence number for cgroup.kill. Incremented with both cgroup_mutex
+	 * and css_set_lock held. Readers hold either one.
+	 */
 	unsigned int kill_seq;
 
 	struct kernfs_node *kn;		/* cgroup kernfs entry */
@@ -609,9 +621,6 @@ struct cgroup {
 	/* used to wait for offlining of csses */
 	wait_queue_head_t offline_waitq;
 
-	/* defers killing csses after removal until cgroup is depopulated */
-	struct work_struct finish_destroy_work;
-
 	/* used to schedule release agent */
 	struct work_struct release_agent_work;
 
@@ -626,6 +635,9 @@ struct cgroup {
 
 #ifdef CONFIG_BPF_SYSCALL
 	struct bpf_local_storage __rcu  *bpf_cgrp_storage;
+#endif
+#ifdef CONFIG_EXT_SUB_SCHED
+	struct scx_sched __rcu *scx_sched;
 #endif
 
 	/* All ancestors including self */
@@ -887,7 +899,7 @@ static inline void cgroup_threadgroup_change_begin(struct task_struct *tsk)
  * cgroup_threadgroup_change_end - threadgroup exclusion for cgroups
  * @tsk: target task
  *
- * Counterpart of cgroup_threadcgroup_change_begin().
+ * Counterpart of cgroup_threadgroup_change_begin().
  */
 static inline void cgroup_threadgroup_change_end(struct task_struct *tsk)
 {

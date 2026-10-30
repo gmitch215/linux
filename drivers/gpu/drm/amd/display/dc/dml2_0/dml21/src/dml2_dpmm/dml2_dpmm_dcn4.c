@@ -279,6 +279,26 @@ static bool round_up_and_copy_to_next_dpm(unsigned long min_value, unsigned long
 	bool result = false;
 	int index = 0;
 
+	/* Guard against empty clock tables (e.g. DTBCLK on DCN42B where the
+	 * clock is tied off and num_clk_values == 0).  Without this check the
+	 * else-if branch below would evaluate
+	 * clk_values_khz[num_clk_values - 1] with num_clk_values == 0, which
+	 * wraps the unsigned char index to 255 — a 235-element out-of-bounds
+	 * read on an array of DML_MAX_CLK_TABLE_SIZE (20) entries.
+	 *
+	 * Semantic: if the clock doesn't exist on this ASIC but no frequency
+	 * is required (min_value == 0), the request is trivially satisfied.
+	 * If a non-zero frequency is required but the clock is absent, the
+	 * configuration is unsupportable.
+	 */
+	if (clock_table->num_clk_values == 0) {
+		if (min_value == 0) {
+			*rounded_value = 0;
+			return true;
+		}
+		return false;
+	}
+
 	if (clock_table->num_clk_values > 2) {
 		while (index < clock_table->num_clk_values && clock_table->clk_values_khz[index] < min_value)
 			index++;
@@ -532,6 +552,7 @@ static int get_displays_without_vactive_margin_mask(struct dml2_dpmm_map_mode_to
 
 static int get_displays_with_fams_mask(struct dml2_dpmm_map_mode_to_soc_dpm_params_in_out *in_out, int latency_hiding_requirement_us)
 {
+	(void)latency_hiding_requirement_us;
 	unsigned int i;
 	int displays_with_fams_mask = 0x0;
 
@@ -742,7 +763,6 @@ bool dpmm_dcn4_map_mode_to_soc_dpm(struct dml2_dpmm_map_mode_to_soc_dpm_params_i
 	else
 		in_out->programming->stutter.supported_in_blank = false;
 
-	// TODO: Fix me Sam
 	if (in_out->soc_bb->power_management_parameters.z8_min_idle_time > 0 &&
 		in_out->programming->informative.power_management.z8.stutter_period >= in_out->soc_bb->power_management_parameters.z8_min_idle_time)
 		in_out->programming->z8_stutter.meets_eco = true;
@@ -756,6 +776,25 @@ bool dpmm_dcn4_map_mode_to_soc_dpm(struct dml2_dpmm_map_mode_to_soc_dpm_params_i
 		in_out->programming->z8_stutter.supported_in_blank = false;
 
 	return result;
+}
+
+static void dpmm_dcn4_map_mcif_watermarks(struct dml2_dpmm_map_watermarks_params_in_out *in_out)
+{
+	const struct dml2_core_internal_display_mode_lib *mode_lib = &in_out->core->clean_me_up.mode_lib;
+	struct dml2_mcif_global_register_set *mcif_regs = &in_out->programming->mcif_global_regs;
+
+	/* MCIF */
+	mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].urgent = (int unsigned)(mode_lib->mp.Watermark.WritebackUrgentWatermark * 1000.0);
+	mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].uclk_pstate = (int unsigned)(mode_lib->mp.Watermark.WritebackDRAMClockChangeWatermark * 1000.0);
+	mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].fclk_pstate = (int unsigned)(mode_lib->mp.Watermark.WritebackFCLKChangeWatermark * 1000.0);
+	mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].temp_read_or_ppt = (int unsigned)(mode_lib->mp.Watermark.writeback_temp_read_or_ppt_watermark_us * 1000.0);
+
+	/* replicate sets A through D */
+	memcpy(&mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_B], &mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A], sizeof(mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A]));
+	memcpy(&mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_C], &mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A], sizeof(mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A]));
+	memcpy(&mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_D], &mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A], sizeof(mcif_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A]));
+
+	mcif_regs->num_watermark_sets = 4;
 }
 
 bool dpmm_dcn4_map_watermarks(struct dml2_dpmm_map_watermarks_params_in_out *in_out)
@@ -799,6 +838,41 @@ bool dpmm_dcn4_map_watermarks(struct dml2_dpmm_map_watermarks_params_in_out *in_
 	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_B].frac_urg_bw_mall = (unsigned int)(mode_lib->mp.FractionOfUrgentBandwidthMALL * 1000);
 
 	dchubbub_regs->num_watermark_sets = 2;
+
+	dpmm_dcn4_map_mcif_watermarks(in_out);
+
+	return true;
+}
+bool dpmm_dcn42_map_watermarks(struct dml2_dpmm_map_watermarks_params_in_out *in_out)
+{
+	const struct dml2_display_cfg *display_cfg = &in_out->display_cfg->display_config;
+	const struct dml2_core_internal_display_mode_lib *mode_lib = &in_out->core->clean_me_up.mode_lib;
+	struct dml2_dchub_global_register_set *dchubbub_regs = &in_out->programming->global_regs;
+
+	double refclk_freq_in_mhz = (display_cfg->overrides.hw.dlg_ref_clk_mhz > 0) ? (double)display_cfg->overrides.hw.dlg_ref_clk_mhz : mode_lib->soc.dchub_refclk_mhz;
+
+	/* set A */
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].fclk_pstate = (int unsigned)(mode_lib->mp.Watermark.FCLKChangeWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].sr_enter = (int unsigned)(mode_lib->mp.Watermark.StutterEnterPlusExitWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].sr_exit = (int unsigned)(mode_lib->mp.Watermark.StutterExitWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].sr_enter_z8 = (int unsigned)(mode_lib->mp.Watermark.Z8StutterEnterPlusExitWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].sr_exit_z8 = (int unsigned)(mode_lib->mp.Watermark.Z8StutterExitWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].temp_read_or_ppt = (int unsigned)(mode_lib->mp.Watermark.temp_read_or_ppt_watermark_us * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].uclk_pstate = (int unsigned)(mode_lib->mp.Watermark.DRAMClockChangeWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].urgent = (int unsigned)(mode_lib->mp.Watermark.UrgentWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].usr = (int unsigned)(mode_lib->mp.Watermark.USRRetrainingWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].refcyc_per_trip_to_mem = (unsigned int)(mode_lib->mp.Watermark.UrgentWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].refcyc_per_meta_trip_to_mem = (unsigned int)(mode_lib->mp.Watermark.UrgentWatermark * refclk_freq_in_mhz);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].frac_urg_bw_flip = (unsigned int)(mode_lib->mp.FractionOfUrgentBandwidthImmediateFlip * 1000);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].frac_urg_bw_nom = (unsigned int)(mode_lib->mp.FractionOfUrgentBandwidth * 1000);
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A].frac_urg_bw_mall = (unsigned int)(mode_lib->mp.FractionOfUrgentBandwidthMALL * 1000);
+
+	/* set B */
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_B] = dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A];
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_C] = dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A];
+	dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_D] = dchubbub_regs->wm_regs[DML2_DCHUB_WATERMARK_SET_A];
+
+	dchubbub_regs->num_watermark_sets = 4;
 
 	return true;
 }

@@ -867,10 +867,7 @@ static void __gic_handle_irq_from_irqson(struct pt_regs *regs)
 		nmi_exit();
 	}
 
-	if (gic_prio_masking_enabled()) {
-		gic_pmr_mask_irqs();
-		gic_arch_enable_irqs();
-	}
+	gic_unmask_pnmis();
 
 	if (!is_nmi)
 		__gic_handle_irq(irqnr, regs);
@@ -1603,15 +1600,23 @@ static int gic_irq_domain_translate(struct irq_domain *d,
 
 		switch (fwspec->param[0]) {
 		case 0:			/* SPI */
+			if (fwspec->param[1] > 987)
+				pr_warn_once("SPI %u out of range (use ESPI?)\n", fwspec->param[1]);
 			*hwirq = fwspec->param[1] + 32;
 			break;
 		case 1:			/* PPI */
+			if (fwspec->param[1] > 15)
+				pr_warn_once("PPI %u out of range (use EPPI?)\n", fwspec->param[1]);
 			*hwirq = fwspec->param[1] + 16;
 			break;
 		case 2:			/* ESPI */
+			if (fwspec->param[1] > 1023)
+				pr_warn_once("ESPI %u out of range\n", fwspec->param[1]);
 			*hwirq = fwspec->param[1] + ESPI_BASE_INTID;
 			break;
 		case 3:			/* EPPI */
+			if (fwspec->param[1] > 63)
+				pr_warn_once("EPPI %u out of range\n", fwspec->param[1]);
 			*hwirq = fwspec->param[1] + EPPI_BASE_INTID;
 			break;
 		case GIC_IRQ_TYPE_LPI:	/* LPI */
@@ -2252,7 +2257,7 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
 
 out_unmap_rdist:
 	for (i = 0; i < nr_redist_regions; i++)
-		if (rdist_regs[i].redist_base && !IS_ERR(rdist_regs[i].redist_base))
+		if (!IS_ERR_OR_NULL(rdist_regs[i].redist_base))
 			iounmap(rdist_regs[i].redist_base);
 	kfree(rdist_regs);
 out_unmap_dist:
@@ -2580,7 +2585,7 @@ gic_acpi_init(union acpi_subtable_headers *header, const unsigned long end)
 	if (err)
 		goto out_fwhandle_free;
 
-	acpi_set_irq_model(ACPI_IRQ_MODEL_GIC, gic_v3_get_gsi_domain_id);
+	acpi_set_irq_model(ACPI_IRQ_MODEL_GIC, gic_v3_get_gsi_domain_id, NULL);
 
 	if (static_branch_likely(&supports_deactivate_key))
 		gic_acpi_setup_kvm_info();

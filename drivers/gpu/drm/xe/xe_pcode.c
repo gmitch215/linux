@@ -11,10 +11,14 @@
 
 #include <drm/drm_managed.h>
 
+#include "regs/xe_pmt.h"
 #include "xe_assert.h"
 #include "xe_device.h"
 #include "xe_mmio.h"
 #include "xe_pcode_api.h"
+#include "xe_pm.h"
+#include "xe_printk.h"
+#include "xe_vsec.h"
 
 /**
  * DOC: PCODE
@@ -323,15 +327,17 @@ int xe_pcode_ready(struct xe_device *xe, bool locked)
 }
 
 /**
- * xe_pcode_init: initialize components of PCODE
+ * xe_pcode_init_early() - Initialize components of PCODE
  * @tile: tile instance
  *
  * This function initializes the xe_pcode component.
  * To be called once only during probe.
+ *
+ * Return: 0 on success or a negative error code on failure.
  */
-void xe_pcode_init(struct xe_tile *tile)
+int xe_pcode_init_early(struct xe_tile *tile)
 {
-	drmm_mutex_init(&tile_to_xe(tile)->drm, &tile->pcode.lock);
+	return drmm_mutex_init(&tile_to_xe(tile)->drm, &tile->pcode.lock);
 }
 
 /**
@@ -349,32 +355,30 @@ int xe_pcode_probe_early(struct xe_device *xe)
 }
 ALLOW_ERROR_INJECTION(xe_pcode_probe_early, ERRNO); /* See xe_pci_probe */
 
-/* Helpers with drm device. These should only be called by the display side */
-#if IS_ENABLED(CONFIG_DRM_XE_DISPLAY)
-
-int intel_pcode_read(struct drm_device *drm, u32 mbox, u32 *val, u32 *val1)
+/**
+ * xe_get_pcode_version - Read pcode version via PMT telemetry
+ * @xe: xe instance
+ * @version: pointer to struct xe_pcode_version to store version info
+ *
+ * Reads the pcode version from PMT telemetry and fills the
+ * provided @version structure.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int xe_get_pcode_version(struct xe_device *xe, struct xe_pcode_version *version)
 {
-	struct xe_device *xe = to_xe_device(drm);
-	struct xe_tile *tile = xe_device_get_root_tile(xe);
+	int ret = 0;
 
-	return xe_pcode_read(tile, mbox, val, val1);
+	guard(xe_pm_runtime)(xe);
+
+	ret = xe_pmt_telem_read(xe->drm.dev,
+				xe_mmio_read32(xe_root_tile_mmio(xe), PUNIT_TELEMETRY_GUID),
+				(u64 *)version, PUNIT_VERSION_OFFSET, sizeof(*version));
+	if (ret != sizeof(*version)) {
+		xe_warn(xe, "pcode version read from PMT failed, ret %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+	xe_dbg(xe, "pcode version major %u minor %u engg %u\n", version->major,
+	       version->minor, version->engg);
+	return 0;
 }
-
-int intel_pcode_write_timeout(struct drm_device *drm, u32 mbox, u32 val, int timeout_ms)
-{
-	struct xe_device *xe = to_xe_device(drm);
-	struct xe_tile *tile = xe_device_get_root_tile(xe);
-
-	return xe_pcode_write_timeout(tile, mbox, val, timeout_ms);
-}
-
-int intel_pcode_request(struct drm_device *drm, u32 mbox, u32 request,
-			u32 reply_mask, u32 reply, int timeout_base_ms)
-{
-	struct xe_device *xe = to_xe_device(drm);
-	struct xe_tile *tile = xe_device_get_root_tile(xe);
-
-	return xe_pcode_request(tile, mbox, request, reply_mask, reply, timeout_base_ms);
-}
-
-#endif

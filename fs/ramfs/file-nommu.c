@@ -14,7 +14,7 @@
 #include <linux/string.h>
 #include <linux/backing-dev.h>
 #include <linux/ramfs.h>
-#include <linux/pagevec.h>
+#include <linux/folio_batch.h>
 #include <linux/mman.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -69,6 +69,9 @@ int ramfs_nommu_expand_for_mapping(struct inode *inode, size_t newsize)
 	gfp_t gfp = mapping_gfp_mask(inode->i_mapping);
 
 	/* make various checks */
+	if (!newsize)
+		return 0;
+
 	order = get_order(newsize);
 	if (unlikely(order > MAX_PAGE_ORDER))
 		return -EFBIG;

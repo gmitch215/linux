@@ -694,6 +694,9 @@ static int ravb_dmac_init(struct net_device *ndev)
 	const struct ravb_hw_info *info = priv->info;
 	int error;
 
+	/* Clear transmission suspension */
+	ravb_modify(ndev, CCC, CCC_DTSR, 0);
+
 	/* Set CONFIG mode */
 	error = ravb_set_opmode(ndev, CCC_OPC_CONFIG);
 	if (error)
@@ -1102,6 +1105,15 @@ static int ravb_stop_dma(struct net_device *ndev)
 	error = ravb_wait(ndev, CSR, CSR_RPO, 0);
 	if (error)
 		return error;
+
+	/* Request for transmission suspension */
+	ravb_modify(ndev, CCC, CCC_DTSR, CCC_DTSR);
+	/* Access to URAM will not be suspended if WoL is enabled. */
+	if (!priv->wol_enabled) {
+		error = ravb_wait(ndev, CSR, CSR_DTS, CSR_DTS);
+		if (error)
+			netdev_err(ndev, "failed to stop AXI BUS\n");
+	}
 
 	/* Stop AVB-DMAC process */
 	return ravb_set_opmode(ndev, CCC_OPC_CONFIG);
@@ -1767,7 +1779,7 @@ static int ravb_get_ts_info(struct net_device *ndev,
 			(1 << HWTSTAMP_FILTER_NONE) |
 			(1 << HWTSTAMP_FILTER_PTP_V2_L2_EVENT) |
 			(1 << HWTSTAMP_FILTER_ALL);
-		info->phc_index = ptp_clock_index(priv->ptp.clock);
+		info->phc_index = READ_ONCE(priv->ptp.phc_index);
 	}
 
 	return 0;
@@ -2367,6 +2379,7 @@ static int ravb_close(struct net_device *ndev)
 	ravb_write(ndev, 0, RIC0);
 	ravb_write(ndev, 0, RIC2);
 	ravb_write(ndev, 0, TIC);
+	ravb_write(ndev, 0, ECSIPR);
 
 	/* PHY disconnect */
 	if (ndev->phydev) {
@@ -2872,11 +2885,13 @@ static int ravb_setup_irqs(struct ravb_private *priv)
 		return error;
 
 	if (info->err_mgmt_irqs) {
-		error = ravb_setup_irq(priv, "err_a", "err_a", NULL, ravb_multi_interrupt);
+		error = ravb_setup_irq(priv, "err_a", "err_a", &priv->err_irq,
+				       ravb_multi_interrupt);
 		if (error)
 			return error;
 
-		error = ravb_setup_irq(priv, "mgmt_a", "mgmt_a", NULL, ravb_multi_interrupt);
+		error = ravb_setup_irq(priv, "mgmt_a", "mgmt_a", &priv->mgmt_irq,
+				       ravb_multi_interrupt);
 		if (error)
 			return error;
 	}
@@ -2940,6 +2955,7 @@ static int ravb_probe(struct platform_device *pdev)
 	priv->rstc = rstc;
 	priv->ndev = ndev;
 	priv->pdev = pdev;
+	priv->ptp.phc_index = -1;
 	priv->num_tx_ring[RAVB_BE] = BE_TX_RING_SIZE;
 	priv->num_rx_ring[RAVB_BE] = BE_RX_RING_SIZE;
 	if (info->nc_queues) {

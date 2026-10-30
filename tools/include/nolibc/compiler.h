@@ -36,9 +36,9 @@
 #endif /* defined(__SSP__) ... */
 
 #if __nolibc_has_attribute(no_stack_protector)
-#  define __no_stack_protector __attribute__((no_stack_protector))
+#  define __nolibc_no_stack_protector __attribute__((no_stack_protector))
 #else
-#  define __no_stack_protector __attribute__((__optimize__("-fno-stack-protector")))
+#  define __nolibc_no_stack_protector __attribute__((__optimize__("-fno-stack-protector")))
 #endif /* __nolibc_has_attribute(no_stack_protector) */
 
 #if __nolibc_has_attribute(__fallthrough__)
@@ -75,6 +75,19 @@
 #  define __nolibc_static_assert(_t) _Static_assert(_t, "")
 #else
 #  define __nolibc_static_assert(_t)
+#endif
+
+/* Make the optimizer believe the variable can be manipulated arbitrarily. */
+#define _NOLIBC_OPTIMIZER_HIDE_VAR(var)	__asm__ ("" : "+r" (var))
+
+#if __nolibc_has_feature(undefined_behavior_sanitizer)
+#  if defined(__clang__)
+#    define __nolibc_no_sanitize_undefined __attribute__((no_sanitize("function")))
+#  else
+#    define __nolibc_no_sanitize_undefined __attribute__((no_sanitize_undefined))
+#  endif
+#else
+#  define __nolibc_no_sanitize_undefined
 #endif
 
 #endif /* _NOLIBC_COMPILER_H */

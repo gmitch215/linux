@@ -623,7 +623,41 @@ out:
 
 EXPORT_SYMBOL_GPL(fat_build_inode);
 
-static int __fat_write_inode(struct inode *inode, int wait);
+static int __fat_write_inode(struct inode *inode);
+
+static int fat_sync_inode_metadata(struct inode *inode,
+				   struct writeback_control *wbc)
+{
+	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
+	struct buffer_head *bh;
+	loff_t i_pos;
+	sector_t blocknr;
+	int offset;
+
+	/* The root directory has no directory entry of its own. */
+	if (inode->i_ino == MSDOS_ROOT_INO)
+		goto sync_bhs;
+	i_pos = fat_i_pos_read(sbi, inode);
+	if (!i_pos)
+		goto sync_bhs;
+
+	fat_get_blknr_offset(sbi, i_pos, &blocknr, &offset);
+	bh = sb_find_get_block_nonatomic(inode->i_sb, blocknr);
+	/*
+	 * Buffer present? We leave buffer_dirty check for sync_dirty_buffer()
+	 * for proper synchronization with ongoing IO.
+	 */
+	if (bh && buffer_uptodate(bh)) {
+		sync_dirty_buffer(bh);
+		if (buffer_write_io_error(bh)) {
+			brelse(bh);
+			return -EIO;
+		}
+	}
+	brelse(bh);
+sync_bhs:
+	return mmb_sync(&MSDOS_I(inode)->i_metadata_bhs);
+}
 
 static void fat_free_eofblocks(struct inode *inode)
 {
@@ -640,7 +674,7 @@ static void fat_free_eofblocks(struct inode *inode)
 		 * any corruption on the next access to the cluster
 		 * chain for the file.
 		 */
-		err = __fat_write_inode(inode, inode_needs_sync(inode));
+		err = sync_inode_metadata(inode, inode_needs_sync(inode));
 		if (err) {
 			fat_msg(inode->i_sb, KERN_WARNING, "Failed to "
 					"update on disk inode for unused "
@@ -657,10 +691,12 @@ static void fat_evict_inode(struct inode *inode)
 	if (!inode->i_nlink) {
 		inode->i_size = 0;
 		fat_truncate_blocks(inode, 0);
-	} else
+	} else {
+		mmb_sync(&MSDOS_I(inode)->i_metadata_bhs);
 		fat_free_eofblocks(inode);
+	}
 
-	invalidate_inode_buffers(inode);
+	mmb_invalidate(&MSDOS_I(inode)->i_metadata_bhs);
 	clear_inode(inode);
 	fat_cache_inval_inode(inode);
 	fat_detach(inode);
@@ -761,6 +797,7 @@ static struct inode *fat_alloc_inode(struct super_block *sb)
 	ei->i_pos = 0;
 	ei->i_crtime.tv_sec = 0;
 	ei->i_crtime.tv_nsec = 0;
+	mmb_init(&ei->i_metadata_bhs, &ei->vfs_inode.i_data);
 
 	return &ei->vfs_inode;
 }
@@ -851,7 +888,7 @@ static int fat_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
-static int __fat_write_inode(struct inode *inode, int wait)
+static int __fat_write_inode(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
@@ -860,10 +897,13 @@ static int __fat_write_inode(struct inode *inode, int wait)
 	struct timespec64 mtime;
 	loff_t i_pos;
 	sector_t blocknr;
-	int err, offset;
+	int offset;
 
-	if (inode->i_ino == MSDOS_ROOT_INO)
+	if (inode->i_ino == MSDOS_ROOT_INO) {
+		/* No entry to update but the metadata bh list may need syncing. */
+		set_inode_metadata_writeback(inode);
 		return 0;
+	}
 
 retry:
 	i_pos = fat_i_pos_read(sbi, inode);
@@ -904,11 +944,9 @@ retry:
 	}
 	spin_unlock(&sbi->inode_hash_lock);
 	mark_buffer_dirty(bh);
-	err = 0;
-	if (wait)
-		err = sync_dirty_buffer(bh);
 	brelse(bh);
-	return err;
+	set_inode_metadata_writeback(inode);
+	return 0;
 }
 
 static int fat_write_inode(struct inode *inode, struct writeback_control *wbc)
@@ -922,23 +960,17 @@ static int fat_write_inode(struct inode *inode, struct writeback_control *wbc)
 		err = fat_clusters_flush(sb);
 		mutex_unlock(&MSDOS_SB(sb)->s_lock);
 	} else
-		err = __fat_write_inode(inode, wbc->sync_mode == WB_SYNC_ALL);
+		err = __fat_write_inode(inode);
 
 	return err;
 }
-
-int fat_sync_inode(struct inode *inode)
-{
-	return __fat_write_inode(inode, 1);
-}
-
-EXPORT_SYMBOL_GPL(fat_sync_inode);
 
 static int fat_show_options(struct seq_file *m, struct dentry *root);
 static const struct super_operations fat_sops = {
 	.alloc_inode	= fat_alloc_inode,
 	.free_inode	= fat_free_inode,
 	.write_inode	= fat_write_inode,
+	.sync_inode_metadata = fat_sync_inode_metadata,
 	.evict_inode	= fat_evict_inode,
 	.put_super	= fat_put_super,
 	.statfs		= fat_statfs,
@@ -1476,8 +1508,9 @@ static int fat_read_static_bpb(struct super_block *sb,
 	int error = -EINVAL;
 	unsigned i;
 
-	/* 16-bit DOS 1.x reliably wrote bootstrap short-jmp code */
-	if (b->ignored[0] != 0xeb || b->ignored[2] != 0x90) {
+	/* 16-bit DOS 1.x reliably wrote bootstrap short-jmp or near-jmp code */
+	if ((b->ignored[0] != 0xeb || b->ignored[2] != 0x90) &&
+	    (b->ignored[0] != 0xe9)) {
 		if (!silent)
 			fat_msg(sb, KERN_ERR,
 				"%s; no bootstrapping code", notdos1x);
@@ -1735,6 +1768,14 @@ int fat_fill_super(struct super_block *sb, struct fs_context *fc,
 	if (total_sectors == 0)
 		total_sectors = bpb.fat_total_sect;
 
+	if (total_sectors < sbi->data_start) {
+		if (!silent)
+			fat_msg(sb, KERN_ERR,
+				"data area starts beyond volume (%lu > %u)",
+				sbi->data_start, total_sectors);
+		goto out_invalid;
+	}
+
 	total_clusters = (total_sectors - sbi->data_start) / sbi->sec_per_clus;
 
 	if (!is_fat32(sbi))
@@ -1783,7 +1824,7 @@ int fat_fill_super(struct super_block *sb, struct fs_context *fc,
 	 */
 
 	error = -EINVAL;
-	sprintf(buf, "cp%d", sbi->options.codepage);
+	scnprintf(buf, sizeof(buf), "cp%d", sbi->options.codepage);
 	sbi->nls_disk = load_nls(buf);
 	if (!sbi->nls_disk) {
 		fat_msg(sb, KERN_ERR, "codepage %s not found", buf);

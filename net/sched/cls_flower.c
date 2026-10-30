@@ -59,18 +59,14 @@ struct fl_flow_key {
 	struct flow_dissector_key_eth_addrs eth;
 	struct flow_dissector_key_vlan vlan;
 	struct flow_dissector_key_vlan cvlan;
-	union {
-		struct flow_dissector_key_ipv4_addrs ipv4;
-		struct flow_dissector_key_ipv6_addrs ipv6;
-	};
+	struct flow_dissector_key_ipv4_addrs ipv4;
+	struct flow_dissector_key_ipv6_addrs ipv6;
 	struct flow_dissector_key_ports tp;
 	struct flow_dissector_key_icmp icmp;
 	struct flow_dissector_key_arp arp;
 	struct flow_dissector_key_keyid enc_key_id;
-	union {
-		struct flow_dissector_key_ipv4_addrs enc_ipv4;
-		struct flow_dissector_key_ipv6_addrs enc_ipv6;
-	};
+	struct flow_dissector_key_ipv4_addrs enc_ipv4;
+	struct flow_dissector_key_ipv6_addrs enc_ipv6;
 	struct flow_dissector_key_ports enc_tp;
 	struct flow_dissector_key_mpls mpls;
 	struct flow_dissector_key_tcp tcp;
@@ -1707,6 +1703,11 @@ static int fl_set_enc_opt(struct nlattr **tb, struct fl_flow_key *key,
 			return -EINVAL;
 		}
 		nla_opt_msk = nla_next(nla_opt_msk, &msk_depth);
+
+		if (msk_depth && !nla_ok(nla_opt_msk, msk_depth)) {
+			NL_SET_ERR_MSG(extack, "A mask attribute is invalid");
+			return -EINVAL;
+		}
 	}
 
 	return 0;
@@ -2237,7 +2238,7 @@ static struct fl_flow_mask *fl_create_new_mask(struct cls_fl_head *head,
 	struct fl_flow_mask *newmask;
 	int err;
 
-	newmask = kzalloc_obj(*newmask);
+	newmask = kzalloc_obj(*newmask, GFP_KERNEL_ACCOUNT);
 	if (!newmask)
 		return ERR_PTR(-ENOMEM);
 
@@ -2398,7 +2399,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 		goto errout_tb;
 	}
 
-	fnew = kzalloc_obj(*fnew);
+	fnew = kzalloc_obj(*fnew, GFP_KERNEL_ACCOUNT);
 	if (!fnew) {
 		err = -ENOBUFS;
 		goto errout_tb;

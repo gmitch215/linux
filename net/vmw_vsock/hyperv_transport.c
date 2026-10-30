@@ -196,7 +196,7 @@ static int hvs_channel_readable_payload(struct vmbus_channel *chan)
 
 	if (readable > HVS_PKT_LEN(0)) {
 		/* At least we have 1 byte to read. We don't need to return
-		 * the exact readable bytes: see vsock_stream_recvmsg() ->
+		 * the exact readable bytes: see vsock_connectible_recvmsg() ->
 		 * vsock_stream_has_data().
 		 */
 		return 1;
@@ -323,7 +323,7 @@ static void hvs_open_connection(struct vmbus_channel *chan)
 		goto out;
 
 	if (conn_from_host) {
-		if (sk->sk_ack_backlog >= sk->sk_max_ack_backlog)
+		if (sk_acceptq_is_full(sk))
 			goto out;
 
 		new = vsock_create_connected(sk);
@@ -410,7 +410,6 @@ static void hvs_open_connection(struct vmbus_channel *chan)
 
 	if (conn_from_host) {
 		new->sk_state = TCP_ESTABLISHED;
-		sk_acceptq_added(sk);
 
 		hvs_new->vm_srv_id = *if_type;
 		hvs_new->host_srv_id = *if_instance;
@@ -961,9 +960,6 @@ static struct hv_driver hvs_drv = {
 static int __init hvs_init(void)
 {
 	int ret;
-
-	if (vmbus_proto_version < VERSION_WIN10)
-		return -ENODEV;
 
 	ret = vmbus_driver_register(&hvs_drv);
 	if (ret != 0)

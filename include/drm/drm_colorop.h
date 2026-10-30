@@ -197,8 +197,21 @@ struct drm_colorop_state {
 	 */
 	enum drm_colorop_lut3d_interpolation_type lut3d_interpolation;
 
-	/** @state: backpointer to global drm_atomic_state */
-	struct drm_atomic_state *state;
+	/** @state: backpointer to global drm_atomic_commit */
+	struct drm_atomic_commit *state;
+};
+
+/**
+ * struct drm_colorop_funcs - driver colorop control functions
+ */
+struct drm_colorop_funcs {
+	/**
+	 * @destroy:
+	 *
+	 * Clean up colorop resources. This is called at driver unload time
+	 * through drm_mode_config_cleanup()
+	 */
+	void (*destroy)(struct drm_colorop *colorop);
 };
 
 /**
@@ -360,6 +373,8 @@ struct drm_colorop {
 	 */
 	struct drm_property *next_property;
 
+	/** @funcs: colorop control functions */
+	const struct drm_colorop_funcs *funcs;
 };
 
 #define obj_to_colorop(x) container_of(x, struct drm_colorop, base)
@@ -388,21 +403,28 @@ void drm_colorop_pipeline_destroy(struct drm_device *dev);
 void drm_colorop_cleanup(struct drm_colorop *colorop);
 
 int drm_plane_colorop_curve_1d_init(struct drm_device *dev, struct drm_colorop *colorop,
-				    struct drm_plane *plane, u64 supported_tfs, uint32_t flags);
+				    struct drm_plane *plane, const struct drm_colorop_funcs *funcs,
+				    u64 supported_tfs, uint32_t flags);
 int drm_plane_colorop_curve_1d_lut_init(struct drm_device *dev, struct drm_colorop *colorop,
-					struct drm_plane *plane, uint32_t lut_size,
+					struct drm_plane *plane,
+					const struct drm_colorop_funcs *funcs,
+					uint32_t lut_size,
 					enum drm_colorop_lut1d_interpolation_type interpolation,
 					uint32_t flags);
 int drm_plane_colorop_ctm_3x4_init(struct drm_device *dev, struct drm_colorop *colorop,
-				   struct drm_plane *plane, uint32_t flags);
+				   struct drm_plane *plane, const struct drm_colorop_funcs *funcs,
+				   uint32_t flags);
 int drm_plane_colorop_mult_init(struct drm_device *dev, struct drm_colorop *colorop,
-				struct drm_plane *plane, uint32_t flags);
+				struct drm_plane *plane, const struct drm_colorop_funcs *funcs,
+				uint32_t flags);
 int drm_plane_colorop_3dlut_init(struct drm_device *dev, struct drm_colorop *colorop,
-				 struct drm_plane *plane,
+				 struct drm_plane *plane, const struct drm_colorop_funcs *funcs,
 				 uint32_t lut_size,
 				 enum drm_colorop_lut3d_interpolation_type interpolation,
 				 uint32_t flags);
 
+struct drm_colorop_state *
+drm_atomic_helper_colorop_create_state(struct drm_colorop *colorop);
 struct drm_colorop_state *
 drm_atomic_helper_colorop_duplicate_state(struct drm_colorop *colorop);
 
@@ -417,6 +439,8 @@ void drm_colorop_atomic_destroy_state(struct drm_colorop *colorop,
  * be NULL, e.g. at driver load time) and allocating a new empty state object.
  */
 void drm_colorop_reset(struct drm_colorop *colorop);
+
+void drm_colorop_destroy(struct drm_colorop *colorop);
 
 /**
  * drm_colorop_index - find the index of a registered colorop

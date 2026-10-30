@@ -55,8 +55,6 @@ struct bdi_writeback;
 struct bio;
 struct io_comp_batch;
 struct fiemap_extent_info;
-struct hd_geometry;
-struct iovec;
 struct kiocb;
 struct kobject;
 struct pipe_inode_info;
@@ -440,10 +438,16 @@ struct address_space_operations {
 	int (*swap_activate)(struct swap_info_struct *sis, struct file *file,
 				sector_t *span);
 	void (*swap_deactivate)(struct file *file);
-	int (*swap_rw)(struct kiocb *iocb, struct iov_iter *iter);
 };
 
 extern const struct address_space_operations empty_aops;
+
+/* Structure for tracking metadata buffer heads associated with the mapping */
+struct mapping_metadata_bhs {
+	struct address_space *mapping;	/* Mapping bhs are associated with */
+	spinlock_t lock;	/* Lock protecting bh list */
+	struct list_head list;	/* The list of bhs (b_assoc_buffers) */
+};
 
 /**
  * struct address_space - Contents of a cacheable, mappable object.
@@ -455,7 +459,6 @@ extern const struct address_space_operations empty_aops;
  *   memory mappings.
  * @gfp_mask: Memory allocation flags to use for allocating pages.
  * @i_mmap_writable: Number of VM_SHARED, VM_MAYWRITE mappings.
- * @nr_thps: Number of THPs in the pagecache (non-shmem only).
  * @i_mmap: Tree of private and shared mappings.
  * @i_mmap_rwsem: Protects @i_mmap and @i_mmap_writable.
  * @nrpages: Number of page entries, protected by the i_pages lock.
@@ -464,8 +467,6 @@ extern const struct address_space_operations empty_aops;
  * @flags: Error bits and flags (AS_*).
  * @wb_err: The most recent error which has occurred.
  * @i_private_lock: For use by the owner of the address_space.
- * @i_private_list: For use by the owner of the address_space.
- * @i_private_data: For use by the owner of the address_space.
  */
 struct address_space {
 	struct inode		*host;
@@ -473,10 +474,6 @@ struct address_space {
 	struct rw_semaphore	invalidate_lock;
 	gfp_t			gfp_mask;
 	atomic_t		i_mmap_writable;
-#ifdef CONFIG_READ_ONLY_THP_FOR_FS
-	/* number of thp, only for non-shmem files */
-	atomic_t		nr_thps;
-#endif
 	struct rb_root_cached	i_mmap;
 	unsigned long		nrpages;
 	pgoff_t			writeback_index;
@@ -484,9 +481,7 @@ struct address_space {
 	unsigned long		flags;
 	errseq_t		wb_err;
 	spinlock_t		i_private_lock;
-	struct list_head	i_private_list;
 	struct rw_semaphore	i_mmap_rwsem;
-	void *			i_private_data;
 } __attribute__((aligned(sizeof(long)))) __randomize_layout;
 	/*
 	 * On most architectures that alignment is already the case; but
@@ -744,7 +739,8 @@ enum inode_state_flags_enum {
 	I_CREATING		= (1U << 15),
 	I_DONTCACHE		= (1U << 16),
 	I_SYNC_QUEUED		= (1U << 17),
-	I_PINNING_NETFS_WB	= (1U << 18)
+	I_PINNING_NETFS_WB	= (1U << 18),
+	I_METADATA_WRITEBACK	= (1U << 19),
 };
 
 #define I_DIRTY_INODE (I_DIRTY_SYNC | I_DIRTY_DATASYNC)
@@ -783,7 +779,7 @@ struct inode {
 #endif
 
 	/* Stat data, not accessed from path walking */
-	unsigned long		i_ino;
+	u64			i_ino;
 	/*
 	 * Filesystems may only read i_nlink directly.  They shall use the
 	 * following functions for modification:
@@ -1602,12 +1598,12 @@ struct timespec64 inode_set_ctime_deleg(struct inode *inode,
 
 static inline time64_t inode_get_atime_sec(const struct inode *inode)
 {
-	return inode->i_atime_sec;
+	return READ_ONCE(inode->i_atime_sec);
 }
 
 static inline long inode_get_atime_nsec(const struct inode *inode)
 {
-	return inode->i_atime_nsec;
+	return READ_ONCE(inode->i_atime_nsec);
 }
 
 static inline struct timespec64 inode_get_atime(const struct inode *inode)
@@ -1621,8 +1617,8 @@ static inline struct timespec64 inode_get_atime(const struct inode *inode)
 static inline struct timespec64 inode_set_atime_to_ts(struct inode *inode,
 						      struct timespec64 ts)
 {
-	inode->i_atime_sec = ts.tv_sec;
-	inode->i_atime_nsec = ts.tv_nsec;
+	WRITE_ONCE(inode->i_atime_sec, ts.tv_sec);
+	WRITE_ONCE(inode->i_atime_nsec, ts.tv_nsec);
 	return ts;
 }
 
@@ -1637,12 +1633,12 @@ static inline struct timespec64 inode_set_atime(struct inode *inode,
 
 static inline time64_t inode_get_mtime_sec(const struct inode *inode)
 {
-	return inode->i_mtime_sec;
+	return READ_ONCE(inode->i_mtime_sec);
 }
 
 static inline long inode_get_mtime_nsec(const struct inode *inode)
 {
-	return inode->i_mtime_nsec;
+	return READ_ONCE(inode->i_mtime_nsec);
 }
 
 static inline struct timespec64 inode_get_mtime(const struct inode *inode)
@@ -1655,8 +1651,8 @@ static inline struct timespec64 inode_get_mtime(const struct inode *inode)
 static inline struct timespec64 inode_set_mtime_to_ts(struct inode *inode,
 						      struct timespec64 ts)
 {
-	inode->i_mtime_sec = ts.tv_sec;
-	inode->i_mtime_nsec = ts.tv_nsec;
+	WRITE_ONCE(inode->i_mtime_sec, ts.tv_sec);
+	WRITE_ONCE(inode->i_mtime_nsec, ts.tv_nsec);
 	return ts;
 }
 
@@ -1681,12 +1677,12 @@ static inline struct timespec64 inode_set_mtime(struct inode *inode,
 
 static inline time64_t inode_get_ctime_sec(const struct inode *inode)
 {
-	return inode->i_ctime_sec;
+	return READ_ONCE(inode->i_ctime_sec);
 }
 
 static inline long inode_get_ctime_nsec(const struct inode *inode)
 {
-	return inode->i_ctime_nsec & ~I_CTIME_QUERIED;
+	return READ_ONCE(inode->i_ctime_nsec) & ~I_CTIME_QUERIED;
 }
 
 static inline struct timespec64 inode_get_ctime(const struct inode *inode)
@@ -1917,11 +1913,8 @@ struct dir_context {
  */
 #define COPY_FILE_SPLICE		(1 << 0)
 
-struct iov_iter;
 struct io_uring_cmd;
 struct offset_ctx;
-
-typedef unsigned int __bitwise fop_flags_t;
 
 struct file_operations {
 	struct module *owner;
@@ -1985,6 +1978,8 @@ struct file_operations {
 #define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
 /* File system supports uncached read/write buffered IO */
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
+/* Never changes and is never removed, readdir of a directory takes no lock */
+#define FOP_IMMUTABLE		((__force fop_flags_t)(1 << 8))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
@@ -2007,7 +2002,7 @@ struct inode_operations {
 	int (*readlink) (struct dentry *, char __user *,int);
 
 	int (*create) (struct mnt_idmap *, struct inode *,struct dentry *,
-		       umode_t, bool);
+		       umode_t);
 	int (*link) (struct dentry *,struct inode *,struct dentry *);
 	int (*unlink) (struct inode *,struct dentry *);
 	int (*symlink) (struct mnt_idmap *, struct inode *,struct dentry *,
@@ -2058,6 +2053,9 @@ static inline bool can_mmap_file(struct file *file)
 	return true;
 }
 
+void compat_set_desc_from_vma(struct vm_area_desc *desc, const struct file *file,
+			      const struct vm_area_struct *vma);
+int __compat_vma_mmap(struct vm_area_desc *desc, struct vm_area_struct *vma);
 int compat_vma_mmap(struct file *file, struct vm_area_struct *vma);
 
 static inline int vfs_mmap(struct file *file, struct vm_area_struct *vma)
@@ -2215,8 +2213,28 @@ static inline void mark_inode_dirty_sync(struct inode *inode)
 	__mark_inode_dirty(inode, I_DIRTY_SYNC);
 }
 
+static inline void set_inode_metadata_writeback(struct inode *inode)
+{
+	spin_lock(&inode->i_lock);
+	inode_state_set(inode, I_METADATA_WRITEBACK);
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * returns the refcount on the inode. it can change arbitrarily.
+ */
+static inline int icount_read_once(const struct inode *inode)
+{
+	return atomic_read(&inode->i_count);
+}
+
+/*
+ * returns the refcount on the inode. The lock guarantees no 0->1 or 1->0 transitions
+ * of the count are going to take place, otherwise it changes arbitrarily.
+ */
 static inline int icount_read(const struct inode *inode)
 {
+	lockdep_assert_held(&inode->i_lock);
 	return atomic_read(&inode->i_count);
 }
 
@@ -2278,12 +2296,15 @@ struct file_system_type {
 #define FS_MGTIME		64	/* FS uses multigrain timestamps */
 #define FS_LBS			128	/* FS supports LBS */
 #define FS_POWER_FREEZE		256	/* Always freeze on suspend/hibernate */
+#define FS_USERNS_MOUNT_RESTRICTED 512	/* Restrict mount in userns if not already visible */
+#define FS_USERNS_DELEGATABLE	1024	/* Can be mounted inside userns from outside */
+#define FS_DISALLOW_NOTIFY	2048	/* No fsnotify marks on its objects */
 #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
 	int (*init_fs_context)(struct fs_context *);
 	const struct fs_parameter_spec *parameters;
 	void (*kill_sb) (struct super_block *);
 	struct module *owner;
-	struct file_system_type * next;
+	struct hlist_node list;
 	struct hlist_head fs_supers;
 
 	struct lock_class_key s_lock_key;
@@ -2324,10 +2345,6 @@ void free_anon_bdev(dev_t);
 struct super_block *sget_fc(struct fs_context *fc,
 			    int (*test)(struct super_block *, struct fs_context *),
 			    int (*set)(struct super_block *, struct fs_context *));
-struct super_block *sget(struct file_system_type *type,
-			int (*test)(struct super_block *,void *),
-			int (*set)(struct super_block *,void *),
-			int flags, void *data);
 struct super_block *sget_dev(struct fs_context *fc, dev_t dev);
 
 /* Alas, no aliases. Too much hassle with bringing module.h everywhere */
@@ -2404,6 +2421,21 @@ static inline void super_set_sysfs_name_generic(struct super_block *sb, const ch
 extern void ihold(struct inode * inode);
 extern void iput(struct inode *);
 void iput_not_last(struct inode *);
+
+/**
+ * iput_if_not_last - drop an inode reference only if it is not the last one
+ * @inode: inode to put
+ *
+ * Returns true if the reference was dropped, false if this was the last
+ * reference and the caller must arrange for final iput() in a safe context.
+ */
+static inline bool __must_check iput_if_not_last(struct inode *inode)
+{
+	VFS_BUG_ON_INODE(inode_state_read_once(inode) & (I_FREEING | I_CLEAR), inode);
+	VFS_BUG_ON_INODE(icount_read_once(inode) < 1, inode);
+	return atomic_add_unless(&inode->i_count, -1, 1);
+}
+
 int inode_update_time(struct inode *inode, enum fs_update_time type,
 		unsigned int flags);
 int generic_update_time(struct inode *inode, enum fs_update_time type,
@@ -2433,6 +2465,11 @@ static_assert(sizeof(struct filename) % 64 == 0);
 static inline struct mnt_idmap *file_mnt_idmap(const struct file *file)
 {
 	return mnt_idmap(file->f_path.mnt);
+}
+
+static inline bool file_owner_or_capable(const struct file *file)
+{
+	return inode_owner_or_capable(file_mnt_idmap(file), file_inode(file));
 }
 
 /**
@@ -2621,6 +2658,7 @@ extern int __must_check file_write_and_wait_range(struct file *file,
 						loff_t start, loff_t end);
 int filemap_flush_range(struct address_space *mapping, loff_t start,
 		loff_t end);
+void filemap_dontcache_kick_writeback(struct address_space *mapping);
 
 static inline int file_write_and_wait(struct file *file)
 {
@@ -2654,10 +2692,7 @@ static inline ssize_t generic_write_sync(struct kiocb *iocb, ssize_t count)
 		if (ret)
 			return ret;
 	} else if (iocb->ki_flags & IOCB_DONTCACHE) {
-		struct address_space *mapping = iocb->ki_filp->f_mapping;
-
-		filemap_flush_range(mapping, iocb->ki_pos - count,
-				iocb->ki_pos - 1);
+		filemap_dontcache_kick_writeback(iocb->ki_filp->f_mapping);
 	}
 
 	return count;
@@ -2923,65 +2958,63 @@ static inline bool name_contains_dotdot(const char *name)
 #include <linux/err.h>
 
 /* needed for stackable file system support */
-extern loff_t default_llseek(struct file *file, loff_t offset, int whence);
+loff_t default_llseek(struct file *file, loff_t offset, int whence);
 
-extern loff_t vfs_llseek(struct file *file, loff_t offset, int whence);
+loff_t vfs_llseek(struct file *file, loff_t offset, int whence);
 
-extern int inode_init_always_gfp(struct super_block *, struct inode *, gfp_t);
+int inode_init_always_gfp(struct super_block *sb, struct inode *inode, gfp_t gfp);
 static inline int inode_init_always(struct super_block *sb, struct inode *inode)
 {
 	return inode_init_always_gfp(sb, inode, GFP_NOFS);
 }
 
-extern void inode_init_once(struct inode *);
-extern void address_space_init_once(struct address_space *mapping);
-extern struct inode * igrab(struct inode *);
-extern ino_t iunique(struct super_block *, ino_t);
-extern int inode_needs_sync(struct inode *inode);
-extern int inode_just_drop(struct inode *inode);
+void inode_init_once(struct inode *inode);
+void address_space_init_once(struct address_space *mapping);
+struct inode *igrab(struct inode *inode);
+ino_t iunique(struct super_block *sb, ino_t max_reserved);
+int inode_needs_sync(struct inode *inode);
+int inode_just_drop(struct inode *inode);
 static inline int inode_generic_drop(struct inode *inode)
 {
 	return !inode->i_nlink || inode_unhashed(inode);
 }
-extern void d_mark_dontcache(struct inode *inode);
+void d_mark_dontcache(struct inode *inode);
 
-extern struct inode *ilookup5_nowait(struct super_block *sb,
-		unsigned long hashval, int (*test)(struct inode *, void *),
-		void *data, bool *isnew);
-extern struct inode *ilookup5(struct super_block *sb, unsigned long hashval,
-		int (*test)(struct inode *, void *), void *data);
-extern struct inode *ilookup(struct super_block *sb, unsigned long ino);
+struct inode *ilookup5_nowait(struct super_block *sb, u64 hashval,
+			      int (*test)(struct inode *, void *), void *data,
+			      bool *isnew);
+struct inode *ilookup5(struct super_block *sb, u64 hashval,
+		       int (*test)(struct inode *, void *), void *data);
+struct inode *ilookup(struct super_block *sb, u64 ino);
 
-extern struct inode *inode_insert5(struct inode *inode, unsigned long hashval,
-		int (*test)(struct inode *, void *),
-		int (*set)(struct inode *, void *),
-		void *data);
-struct inode *iget5_locked(struct super_block *, unsigned long,
+struct inode *inode_insert5(struct inode *inode, u64 hashval,
+			    int (*test)(struct inode *, void *),
+			    int (*set)(struct inode *, void *), void *data);
+struct inode *iget5_locked(struct super_block *sb, u64 hashval,
 			   int (*test)(struct inode *, void *),
-			   int (*set)(struct inode *, void *), void *);
-struct inode *iget5_locked_rcu(struct super_block *, unsigned long,
+			   int (*set)(struct inode *, void *), void *data);
+struct inode *iget5_locked_rcu(struct super_block *sb, u64 hashval,
 			       int (*test)(struct inode *, void *),
-			       int (*set)(struct inode *, void *), void *);
-extern struct inode * iget_locked(struct super_block *, unsigned long);
-extern struct inode *find_inode_nowait(struct super_block *,
-				       unsigned long,
-				       int (*match)(struct inode *,
-						    unsigned long, void *),
-				       void *data);
-extern struct inode *find_inode_rcu(struct super_block *, unsigned long,
-				    int (*)(struct inode *, void *), void *);
-extern struct inode *find_inode_by_ino_rcu(struct super_block *, unsigned long);
-extern int insert_inode_locked4(struct inode *, unsigned long, int (*test)(struct inode *, void *), void *);
-extern int insert_inode_locked(struct inode *);
+			       int (*set)(struct inode *, void *), void *data);
+struct inode *iget_locked(struct super_block *sb, u64 ino);
+struct inode *find_inode_nowait(struct super_block *sb, u64 hashval,
+				int (*match)(struct inode *, u64, void *),
+				void *data);
+struct inode *find_inode_rcu(struct super_block *sb, u64 hashval,
+			     int (*test)(struct inode *, void *), void *data);
+struct inode *find_inode_by_ino_rcu(struct super_block *sb, u64 ino);
+int insert_inode_locked4(struct inode *inode, u64 hashval,
+			 int (*test)(struct inode *, void *), void *data);
+int insert_inode_locked(struct inode *inode);
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
-extern void lockdep_annotate_inode_mutex_key(struct inode *inode);
+void lockdep_annotate_inode_mutex_key(struct inode *inode);
 #else
 static inline void lockdep_annotate_inode_mutex_key(struct inode *inode) { };
 #endif
-extern void unlock_new_inode(struct inode *);
-extern void discard_new_inode(struct inode *);
-extern unsigned int get_next_ino(void);
-extern void evict_inodes(struct super_block *sb);
+void unlock_new_inode(struct inode *inode);
+void discard_new_inode(struct inode *inode);
+unsigned int get_next_ino(void);
+void evict_inodes(struct super_block *sb);
 void dump_mapping(const struct address_space *);
 
 /*
@@ -3026,21 +3059,21 @@ int setattr_should_drop_sgid(struct mnt_idmap *idmap,
  */
 #define alloc_inode_sb(_sb, _cache, _gfp) kmem_cache_alloc_lru(_cache, &_sb->s_inode_lru, _gfp)
 
-extern void __insert_inode_hash(struct inode *, unsigned long hashval);
+void __insert_inode_hash(struct inode *inode, u64 hashval);
 static inline void insert_inode_hash(struct inode *inode)
 {
 	__insert_inode_hash(inode, inode->i_ino);
 }
 
-extern void __remove_inode_hash(struct inode *);
+void __remove_inode_hash(struct inode *inode);
 static inline void remove_inode_hash(struct inode *inode)
 {
 	if (!inode_unhashed(inode) && !hlist_fake(&inode->i_hash))
 		__remove_inode_hash(inode);
 }
 
-extern void inode_sb_list_add(struct inode *inode);
-extern void inode_lru_list_add(struct inode *inode);
+void inode_sb_list_add(struct inode *inode);
+void inode_lru_list_add(struct inode *inode);
 
 int generic_file_mmap(struct file *, struct vm_area_struct *);
 int generic_file_mmap_prepare(struct vm_area_desc *desc);
@@ -3306,8 +3339,8 @@ void simple_offset_destroy(struct offset_ctx *octx);
 
 extern const struct file_operations simple_offset_dir_operations;
 
-extern int __generic_file_fsync(struct file *, loff_t, loff_t, int);
-extern int generic_file_fsync(struct file *, loff_t, loff_t, int);
+extern int simple_fsync_noflush(struct file *, loff_t, loff_t, int);
+extern int simple_fsync(struct file *, loff_t, loff_t, int);
 
 extern int generic_check_addressable(unsigned, u64);
 

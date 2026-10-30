@@ -10,6 +10,8 @@
 
 #include <sound/soc.h>
 
+struct device_link;
+
 /*
  * Component probe and remove ordering levels for components with runtime
  * dependencies.
@@ -76,6 +78,7 @@ struct snd_soc_component_driver {
 	unsigned int num_dapm_routes;
 
 	int (*probe)(struct snd_soc_component *component);
+	int (*fixup_controls)(struct snd_soc_component *component);
 	void (*remove)(struct snd_soc_component *component);
 	int (*suspend)(struct snd_soc_component *component);
 	int (*resume)(struct snd_soc_component *component);
@@ -86,10 +89,6 @@ struct snd_soc_component_driver {
 		     unsigned int reg, unsigned int val);
 
 	/* pcm creation and destruction */
-	int (*pcm_construct)(struct snd_soc_component *component,
-			     struct snd_soc_pcm_runtime *rtd);
-	void (*pcm_destruct)(struct snd_soc_component *component,
-			     struct snd_pcm *pcm);
 	int (*pcm_new)(struct snd_soc_component *component,
 		       struct snd_soc_pcm_runtime *rtd);
 	void (*pcm_free)(struct snd_soc_component *component,
@@ -203,9 +202,7 @@ struct snd_soc_component_driver {
 	bool use_dai_pcm_id;	/* use DAI link PCM ID as PCM device number */
 	int be_pcm_base;	/* base device ID for all BE PCMs */
 
-#ifdef CONFIG_DEBUG_FS
 	const char *debugfs_prefix;
-#endif
 };
 
 struct snd_soc_component {
@@ -222,13 +219,14 @@ struct snd_soc_component {
 	struct list_head card_aux_list; /* for auxiliary bound components */
 	struct list_head card_list;
 
+	struct device_link *card_device_link;
+
 	const struct snd_soc_component_driver *driver;
 
 	struct list_head dai_list;
 	int num_dai;
 
 	struct regmap *regmap;
-	int val_bytes;
 
 	struct mutex io_mutex;
 
@@ -255,7 +253,9 @@ struct snd_soc_component {
 	void *mark_pm;
 
 	struct dentry *debugfs_root;
-	const char *debugfs_prefix;
+
+	/* Component private data */
+	void *priv;
 };
 
 #define for_each_component_dais(component, dai)\
@@ -285,6 +285,14 @@ static inline int snd_soc_component_cache_sync(
 {
 	return regcache_sync(component->regmap);
 }
+
+struct snd_soc_component *snd_soc_component_alloc(struct device *dev);
+
+void snd_soc_component_set_name(struct snd_soc_component *component, const char *name);
+const char *snd_soc_component_name(struct snd_soc_component *component);
+
+void snd_soc_component_set_priv(struct snd_soc_component *component, void *priv);
+void *snd_soc_component_to_priv(struct snd_soc_component *component);
 
 void snd_soc_component_set_aux(struct snd_soc_component *component,
 			       struct snd_soc_aux_dev *aux);
@@ -331,7 +339,7 @@ int snd_soc_component_stream_event(struct snd_soc_component *component,
 int snd_soc_component_set_bias_level(struct snd_soc_component *component,
 				     enum snd_soc_bias_level level);
 
-void snd_soc_component_setup_regmap(struct snd_soc_component *component);
+int snd_soc_component_regmap_val_bytes(struct snd_soc_component *component);
 #ifdef CONFIG_REGMAP
 void snd_soc_component_init_regmap(struct snd_soc_component *component,
 				   struct regmap *regmap);
@@ -384,6 +392,7 @@ void snd_soc_component_suspend(struct snd_soc_component *component);
 void snd_soc_component_resume(struct snd_soc_component *component);
 int snd_soc_component_is_suspended(struct snd_soc_component *component);
 int snd_soc_component_probe(struct snd_soc_component *component);
+int snd_soc_component_fixup_controls(struct snd_soc_component *component);
 void snd_soc_component_remove(struct snd_soc_component *component);
 int snd_soc_component_of_xlate_dai_id(struct snd_soc_component *component,
 				      struct device_node *ep);

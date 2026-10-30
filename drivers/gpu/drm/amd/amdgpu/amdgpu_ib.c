@@ -129,7 +129,10 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned int num_ibs,
 	struct amdgpu_ib *ib = &ibs[0];
 	struct dma_fence *tmp = NULL;
 	struct amdgpu_fence *af;
+	struct amdgpu_fence *vm_af;
 	bool need_ctx_switch;
+	bool emit_spm_needed = false;
+	bool emit_gds_needed = false;
 	struct amdgpu_vm *vm;
 	uint64_t fence_ctx;
 	uint32_t status = 0, alloc_size;
@@ -215,25 +218,42 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned int num_ibs,
 		dma_fence_put(tmp);
 	}
 
+	if (job) {
+		vm_af = job->hw_vm_fence;
+		/* VM sequence */
+		vm_af->ib_wptr = ring->wptr;
+		amdgpu_vm_flush(ring, job, &need_pipe_sync, &emit_spm_needed,
+				&emit_gds_needed);
+		vm_af->ib_dw_size =
+			amdgpu_ring_get_dw_distance(ring, vm_af->ib_wptr, ring->wptr);
+	}
+
+	/* IB sequence */
+	af->ib_wptr = ring->wptr;
+	amdgpu_ring_ib_begin(ring);
+
+	if (ring->funcs->insert_start)
+		ring->funcs->insert_start(ring);
+
+	/* this may have been handled by amdgpu_vm_flush */
+	if (need_pipe_sync)
+		amdgpu_ring_emit_pipeline_sync(ring);
+
+	if (emit_spm_needed)
+		adev->gfx.rlc.funcs->update_spm_vmid(adev, ring->xcc_id, ring, job->vmid);
+
+	if (emit_gds_needed)
+		amdgpu_ring_emit_gds_switch(ring, job->vmid, job->gds_base,
+					    job->gds_size, job->gws_base,
+					    job->gws_size, job->oa_base,
+					    job->oa_size);
+
 	if ((ib->flags & AMDGPU_IB_FLAG_EMIT_MEM_SYNC) && ring->funcs->emit_mem_sync)
 		ring->funcs->emit_mem_sync(ring);
 
 	if (ring->funcs->emit_wave_limit &&
 	    ring->hw_prio == AMDGPU_GFX_PIPE_PRIO_HIGH)
 		ring->funcs->emit_wave_limit(ring, true);
-
-	if (ring->funcs->insert_start)
-		ring->funcs->insert_start(ring);
-
-	if (job) {
-		r = amdgpu_vm_flush(ring, job, need_pipe_sync);
-		if (r) {
-			amdgpu_ring_undo(ring);
-			goto free_fence;
-		}
-	}
-
-	amdgpu_ring_ib_begin(ring);
 
 	if (ring->funcs->emit_gfx_shadow && adev->gfx.cp_gfx_shadow)
 		amdgpu_ring_emit_gfx_shadow(ring, shadow_va, csa_va, gds_va,
@@ -243,6 +263,9 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned int num_ibs,
 		cond_exec = amdgpu_ring_init_cond_exec(ring,
 						       ring->cond_exe_gpu_addr);
 
+	/* Skip the IB for guilty contexts */
+	af->skip_ib_dw_start_offset =
+		amdgpu_ring_get_dw_distance(ring, af->ib_wptr, ring->wptr);
 	amdgpu_device_flush_hdp(adev, ring);
 
 	if (need_ctx_switch)
@@ -281,6 +304,9 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned int num_ibs,
 		amdgpu_ring_emit_frame_cntl(ring, false, secure);
 
 	amdgpu_device_invalidate_hdp(adev, ring);
+	/* Skip the IB for guilty contexts */
+	af->skip_ib_dw_end_offset =
+		amdgpu_ring_get_dw_distance(ring, af->ib_wptr, ring->wptr);
 
 	if (ib->flags & AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE)
 		fence_flags |= AMDGPU_FENCE_FLAG_TC_WB_ONLY;
@@ -297,14 +323,7 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned int num_ibs,
 		amdgpu_ring_init_cond_exec(ring, ring->cond_exe_gpu_addr);
 	}
 
-	r = amdgpu_fence_emit(ring, af, fence_flags);
-	if (r) {
-		dev_err(adev->dev, "failed to emit fence (%d)\n", r);
-		if (job && job->vmid)
-			amdgpu_vmid_reset(adev, ring->vm_hub, job->vmid);
-		amdgpu_ring_undo(ring);
-		goto free_fence;
-	}
+	amdgpu_fence_emit(ring, af, fence_flags);
 	*f = &af->base;
 	/* get a ref for the job */
 	if (job)
@@ -323,15 +342,10 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned int num_ibs,
 	    ring->hw_prio == AMDGPU_GFX_PIPE_PRIO_HIGH)
 		ring->funcs->emit_wave_limit(ring, false);
 
-	/* Save the wptr associated with this fence.
-	 * This must be last for resets to work properly
-	 * as we need to save the wptr associated with this
-	 * fence so we know what rings contents to backup
-	 * after we reset the queue.
-	 */
-	amdgpu_fence_save_wptr(af);
-
 	amdgpu_ring_ib_end(ring);
+
+	af->ib_dw_size = amdgpu_ring_get_dw_distance(ring, af->ib_wptr, ring->wptr);
+
 	amdgpu_ring_commit(ring);
 
 	return 0;
@@ -353,6 +367,30 @@ free_fence:
  */
 int amdgpu_ib_pool_init(struct amdgpu_device *adev)
 {
+	const int sizes[AMDGPU_IB_POOL_MAX] = {
+		[AMDGPU_IB_POOL_DELAYED] = SZ_1M,
+		[AMDGPU_IB_POOL_IMMEDIATE] = SZ_128K,
+		[AMDGPU_IB_POOL_DIRECT] = SZ_512K
+	};
+	const gfp_t gfp_flags[AMDGPU_IB_POOL_MAX] = {
+		/*
+		 * For normal page table updates and recoverable retry faults
+		 * (for SVM), further restricted by the VM eviction lock to not
+		 * wait for memory reclaim.
+		 */
+		[AMDGPU_IB_POOL_DELAYED] = GFP_KERNEL,
+		/*
+		 * For redirecting unrecoverable retry faults to the dummy page
+		 * or set the PRT bits. dma_fence submissions might depend on
+		 * that so we need the emmergency reserves.
+		 */
+		[AMDGPU_IB_POOL_IMMEDIATE] = GFP_ATOMIC,
+		/*
+		 * For IB tests during GPU resets. Only very small and temporary
+		 * allocation to allow dma_fences to signal.
+		 */
+		[AMDGPU_IB_POOL_DIRECT] = GFP_ATOMIC
+	};
 	int r, i;
 
 	if (adev->ib_pool_ready)
@@ -360,8 +398,7 @@ int amdgpu_ib_pool_init(struct amdgpu_device *adev)
 
 	for (i = 0; i < AMDGPU_IB_POOL_MAX; i++) {
 		r = amdgpu_sa_bo_manager_init(adev, &adev->ib_pools[i],
-					      AMDGPU_IB_POOL_SIZE, 256,
-					      AMDGPU_GEM_DOMAIN_GTT);
+					      sizes[i], gfp_flags[i]);
 		if (r)
 			goto error;
 	}
@@ -393,6 +430,17 @@ void amdgpu_ib_pool_fini(struct amdgpu_device *adev)
 	for (i = 0; i < AMDGPU_IB_POOL_MAX; i++)
 		amdgpu_sa_bo_manager_fini(adev, &adev->ib_pools[i]);
 	adev->ib_pool_ready = false;
+}
+
+/**
+ * amdgpu_ib_pool_gfp_flags - Returns the gfp flags to use for each pool
+ * @adev: amdgpu device pointer
+ * @type: the IB pool type
+ */
+gfp_t amdgpu_ib_pool_gfp_flags(struct amdgpu_device *adev,
+			       enum amdgpu_ib_pool_type type)
+{
+	return adev->ib_pools[type].gfp_flags;
 }
 
 /**

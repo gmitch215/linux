@@ -66,10 +66,9 @@ void ovl_tempname(char name[OVL_TEMPNAME_SIZE])
 }
 
 static struct dentry *ovl_start_creating_temp(struct ovl_fs *ofs,
-					      struct dentry *workdir)
+					      struct dentry *workdir,
+					      char name[OVL_TEMPNAME_SIZE])
 {
-	char name[OVL_TEMPNAME_SIZE];
-
 	ovl_tempname(name);
 	return start_creating(ovl_upper_mnt_idmap(ofs), workdir,
 			      &QSTR(name));
@@ -81,11 +80,12 @@ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
 	struct dentry *whiteout, *link;
 	struct dentry *workdir = ofs->workdir;
 	struct inode *wdir = workdir->d_inode;
+	char name[OVL_TEMPNAME_SIZE];
 
 	guard(mutex)(&ofs->whiteout_lock);
 
 	if (!ofs->whiteout) {
-		whiteout = ovl_start_creating_temp(ofs, workdir);
+		whiteout = ovl_start_creating_temp(ofs, workdir, name);
 		if (IS_ERR(whiteout))
 			return whiteout;
 		err = ovl_do_whiteout(ofs, wdir, whiteout);
@@ -97,7 +97,7 @@ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
 	}
 
 	if (!ofs->no_shared_whiteout) {
-		link = ovl_start_creating_temp(ofs, workdir);
+		link = ovl_start_creating_temp(ofs, workdir, name);
 		if (IS_ERR(link))
 			return link;
 		err = ovl_do_link(ofs, ofs->whiteout, wdir, link);
@@ -159,7 +159,8 @@ kill_whiteout:
 }
 
 struct dentry *ovl_create_real(struct ovl_fs *ofs, struct dentry *parent,
-			       struct dentry *newdentry, struct ovl_cattr *attr)
+			       struct dentry *newdentry, struct qstr *qname,
+			       struct ovl_cattr *attr)
 {
 	struct inode *dir = parent->d_inode;
 	int err;
@@ -187,7 +188,6 @@ struct dentry *ovl_create_real(struct ovl_fs *ofs, struct dentry *parent,
 			if (!err && ofs->casefold != ovl_dentry_casefolded(newdentry)) {
 				pr_warn_ratelimited("wrong inherited casefold (%pd2)\n",
 						    newdentry);
-				end_creating(newdentry);
 				err = -EINVAL;
 			}
 			break;
@@ -221,19 +221,30 @@ struct dentry *ovl_create_real(struct ovl_fs *ofs, struct dentry *parent,
 		struct dentry *d;
 		/*
 		 * Some filesystems (i.e. casefolded) may return an unhashed
-		 * negative dentry from the ovl_lookup_upper() call before
+		 * negative dentry from the ovl_start_creating_upper() call before
 		 * ovl_create_real().
 		 * In that case, lookup again after making the newdentry
 		 * positive, so ovl_create_upper() always returns a hashed
-		 * positive dentry.
+		 * positive dentry.  We lookup using qname which should be
+		 * the same name as newentry, but is certain not to change.
+		 * As we have to drop the lock before the lookup a race
+		 * could result in a lookup failure.  In that case we return
+		 * an error.
 		 */
-		d = ovl_lookup_upper(ofs, newdentry->d_name.name, parent,
-				     newdentry->d_name.len);
-		dput(newdentry);
-		if (IS_ERR_OR_NULL(d))
+		end_creating_keep(newdentry);
+		d = ovl_start_creating_upper(ofs, parent, qname);
+
+		if (IS_ERR_OR_NULL(d)) {
 			err = d ? PTR_ERR(d) : -ENOENT;
-		else
+		} else if (d->d_inode != newdentry->d_inode) {
+			err = -EIO;
+		} else {
+			dput(newdentry);
 			return d;
+		}
+		end_creating(d);
+		dput(newdentry);
+		return ERR_PTR(err);
 	}
 out:
 	if (err) {
@@ -247,10 +258,12 @@ struct dentry *ovl_create_temp(struct ovl_fs *ofs, struct dentry *workdir,
 			       struct ovl_cattr *attr)
 {
 	struct dentry *ret;
-	ret = ovl_start_creating_temp(ofs, workdir);
+	char name[OVL_TEMPNAME_SIZE];
+
+	ret = ovl_start_creating_temp(ofs, workdir, name);
 	if (IS_ERR(ret))
 		return ret;
-	ret = ovl_create_real(ofs, workdir, ret, attr);
+	ret = ovl_create_real(ofs, workdir, ret, &QSTR(name), attr);
 	return end_creating_keep(ret);
 }
 
@@ -350,14 +363,15 @@ static int ovl_create_upper(struct dentry *dentry, struct inode *inode,
 	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
 	struct dentry *upperdir = ovl_dentry_upper(dentry->d_parent);
 	struct dentry *newdentry;
+	struct qstr qname = QSTR_LEN(dentry->d_name.name,
+				     dentry->d_name.len);
 	int err;
 
 	newdentry = ovl_start_creating_upper(ofs, upperdir,
-					     &QSTR_LEN(dentry->d_name.name,
-						       dentry->d_name.len));
+					     &qname);
 	if (IS_ERR(newdentry))
 		return PTR_ERR(newdentry);
-	newdentry = ovl_create_real(ofs, upperdir, newdentry, attr);
+	newdentry = ovl_create_real(ofs, upperdir, newdentry, &qname, attr);
 	if (IS_ERR(newdentry))
 		return PTR_ERR(newdentry);
 
@@ -674,8 +688,8 @@ static int ovl_create_or_link(struct dentry *dentry, struct inode *inode,
 	return err;
 }
 
-static int ovl_create_object(struct dentry *dentry, int mode, dev_t rdev,
-			     const char *link)
+static int ovl_create_object(struct mnt_idmap *idmap, struct dentry *dentry,
+			     int mode, dev_t rdev, const char *link)
 {
 	int err;
 	struct inode *inode;
@@ -702,7 +716,7 @@ static int ovl_create_object(struct dentry *dentry, int mode, dev_t rdev,
 	inode_state_set(inode, I_CREATING);
 	spin_unlock(&inode->i_lock);
 
-	inode_init_owner(&nop_mnt_idmap, inode, dentry->d_parent->d_inode, mode);
+	inode_init_owner(idmap, inode, dentry->d_parent->d_inode, mode);
 	attr.mode = inode->i_mode;
 
 	err = ovl_create_or_link(dentry, inode, &attr, false);
@@ -717,15 +731,15 @@ out:
 }
 
 static int ovl_create(struct mnt_idmap *idmap, struct inode *dir,
-		      struct dentry *dentry, umode_t mode, bool excl)
+		      struct dentry *dentry, umode_t mode)
 {
-	return ovl_create_object(dentry, (mode & 07777) | S_IFREG, 0, NULL);
+	return ovl_create_object(idmap, dentry, (mode & 07777) | S_IFREG, 0, NULL);
 }
 
 static struct dentry *ovl_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				struct dentry *dentry, umode_t mode)
 {
-	return ERR_PTR(ovl_create_object(dentry, (mode & 07777) | S_IFDIR, 0, NULL));
+	return ERR_PTR(ovl_create_object(idmap, dentry, (mode & 07777) | S_IFDIR, 0, NULL));
 }
 
 static int ovl_mknod(struct mnt_idmap *idmap, struct inode *dir,
@@ -735,13 +749,13 @@ static int ovl_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (S_ISCHR(mode) && rdev == WHITEOUT_DEV)
 		return -EPERM;
 
-	return ovl_create_object(dentry, mode, rdev, NULL);
+	return ovl_create_object(idmap, dentry, mode, rdev, NULL);
 }
 
 static int ovl_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, const char *link)
 {
-	return ovl_create_object(dentry, S_IFLNK, 0, link);
+	return ovl_create_object(idmap, dentry, S_IFLNK, 0, link);
 }
 
 static int ovl_set_link_redirect(struct dentry *dentry)
@@ -904,7 +918,7 @@ static void ovl_drop_nlink(struct dentry *dentry)
 
 	/* Try to find another, hashed alias */
 	spin_lock(&inode->i_lock);
-	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
+	for_each_alias(alias, inode) {
 		if (alias != dentry && !d_unhashed(alias))
 			break;
 	}
@@ -1429,7 +1443,7 @@ static int ovl_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	if (!inode)
 		goto drop_write;
 
-	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
+	inode_init_owner(idmap, inode, dir, mode);
 	err = ovl_create_tmpfile(file, dentry, inode, inode->i_mode);
 	if (err)
 		goto put_inode;

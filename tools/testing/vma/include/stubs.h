@@ -102,10 +102,10 @@ static inline bool shmem_file(struct file *file)
 	return false;
 }
 
-static inline vm_flags_t ksm_vma_flags(const struct mm_struct *mm,
-		const struct file *file, vm_flags_t vm_flags)
+static inline vma_flags_t ksm_vma_flags(struct mm_struct *mm,
+		const struct file *file, vma_flags_t vma_flags)
 {
-	return vm_flags;
+	return vma_flags;
 }
 
 static inline void remap_pfn_range_prepare(struct vm_area_desc *desc, unsigned long pfn)
@@ -230,7 +230,7 @@ static inline bool signal_pending(void *p)
 	return false;
 }
 
-static inline bool is_file_hugepages(struct file *file)
+static inline bool is_file_hugepages(const struct file *file)
 {
 	return false;
 }
@@ -240,7 +240,8 @@ static inline int security_vm_enough_memory_mm(struct mm_struct *mm, long pages)
 	return 0;
 }
 
-static inline bool may_expand_vm(struct mm_struct *mm, vm_flags_t flags,
+static inline bool may_expand_vm(struct mm_struct *mm,
+				 const vma_flags_t *vma_flags,
 				 unsigned long npages)
 {
 	return true;
@@ -256,13 +257,13 @@ static inline void vm_acct_memory(long pages)
 {
 }
 
-static inline void vma_interval_tree_insert(struct vm_area_struct *vma,
-					    struct rb_root_cached *rb)
+static inline void mapping_rmap_tree_insert(struct vm_area_struct *vma,
+					    struct address_space *mapping)
 {
 }
 
-static inline void vma_interval_tree_remove(struct vm_area_struct *vma,
-					    struct rb_root_cached *rb)
+static inline void mapping_rmap_tree_remove(struct vm_area_struct *vma,
+					    struct address_space *mapping)
 {
 }
 
@@ -270,13 +271,13 @@ static inline void flush_dcache_mmap_unlock(struct address_space *mapping)
 {
 }
 
-static inline void anon_vma_interval_tree_insert(struct anon_vma_chain *avc,
-						 struct rb_root_cached *rb)
+static inline void anon_rmap_tree_insert(struct anon_vma_chain *avc,
+					 struct anon_vma *anon_vma)
 {
 }
 
-static inline void anon_vma_interval_tree_remove(struct anon_vma_chain *avc,
-						 struct rb_root_cached *rb)
+static inline void anon_rmap_tree_remove(struct anon_vma_chain *avc,
+					 struct anon_vma *anon_vma)
 {
 }
 

@@ -190,11 +190,11 @@ static bool xe_fence_set_error(struct dma_fence *fence, int error)
 	unsigned long irq_flags;
 	bool signaled;
 
-	spin_lock_irqsave(fence->lock, irq_flags);
+	dma_fence_lock_irqsave(fence, irq_flags);
 	signaled = test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags);
 	if (!signaled)
 		dma_fence_set_error(fence, error);
-	spin_unlock_irqrestore(fence->lock, irq_flags);
+	dma_fence_unlock_irqrestore(fence, irq_flags);
 
 	return signaled;
 }
@@ -214,7 +214,7 @@ void xe_sched_job_set_error(struct xe_sched_job *job, int error)
 
 	trace_xe_sched_job_set_error(job);
 
-	dma_fence_enable_sw_signaling(job->fence);
+	dma_fence_enable_signaling(job->fence);
 	xe_hw_fence_irq_run(job->q->fence_irq);
 }
 

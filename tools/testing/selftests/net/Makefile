@@ -13,8 +13,10 @@ TEST_PROGS := \
 	arp_ndisc_untracked_subnets.sh \
 	bareudp.sh \
 	big_tcp.sh \
+	big_tcp_tunnels.sh \
 	bind_bhash.sh \
 	bpf_offload.py \
+	bridge_stp_mode.sh \
 	bridge_vlan_dump.sh \
 	broadcast_ether_dst.sh \
 	broadcast_pmtu.sh \
@@ -23,8 +25,11 @@ TEST_PROGS := \
 	cmsg_so_mark.sh \
 	cmsg_so_priority.sh \
 	cmsg_time.sh \
+	cork_fragsize.py \
 	double_udp_encap.sh \
 	drop_monitor_tests.sh \
+	ecmp_rehash.sh \
+	exception_cache.sh \
 	fcnal-ipv4.sh \
 	fcnal-ipv6.sh \
 	fcnal-other.sh \
@@ -37,6 +42,7 @@ TEST_PROGS := \
 	fib_rule_tests.sh \
 	fib_tests.sh \
 	fin_ack_lat.sh \
+	fou_mcast_encap.sh \
 	fq_band_pktlimit.sh \
 	gre_gso.sh \
 	gre_ipv6_lladdr.sh \
@@ -45,6 +51,7 @@ TEST_PROGS := \
 	io_uring_zerocopy_tx.sh \
 	ioam6.sh \
 	ip6_gre_headroom.sh \
+	ip6_tunnel.sh \
 	ip_defrag.sh \
 	ip_local_port_range.sh \
 	ipv6_flowlabel.sh \
@@ -55,6 +62,7 @@ TEST_PROGS := \
 	l2tp.sh \
 	link_netns.py \
 	lwt_dst_cache_ref_loop.sh \
+	macvlan_mcast_shared_mac.sh \
 	msg_zerocopy.sh \
 	nat6to4.sh \
 	ndisc_unsolicited_na_test.sh \
@@ -62,8 +70,11 @@ TEST_PROGS := \
 	netdevice.sh \
 	netns-name.sh \
 	netns-sysctl.sh \
+	nk_qlease.py \
 	nl_netdev.py \
+	nl_nlctrl.py \
 	pmtu.sh \
+	protodown.sh \
 	psock_snd.sh \
 	reuseaddr_ports_exhausted.sh \
 	reuseport_addr_any.sh \
@@ -78,7 +89,7 @@ TEST_PROGS := \
 	rxtimestamp.sh \
 	sctp_vrf.sh \
 	skf_net_off.sh \
-	so_txtime.sh \
+	srv6_encap_lookup_l3vpn_test.sh \
 	srv6_end_dt46_l3vpn_test.sh \
 	srv6_end_dt4_l3vpn_test.sh \
 	srv6_end_dt6_l3vpn_test.sh \
@@ -91,6 +102,7 @@ TEST_PROGS := \
 	srv6_hl2encap_red_l2vpn_test.sh \
 	srv6_iptunnel_cache.sh \
 	stress_reuseport_listen.sh \
+	tcp_ecmp_failover.sh \
 	tcp_fastopen_backup_key.sh \
 	test_bpf.sh \
 	test_bridge_backup_port.sh \
@@ -103,6 +115,7 @@ TEST_PROGS := \
 	test_vxlan_nh.sh \
 	test_vxlan_nolocalbypass.sh \
 	test_vxlan_under_vrf.sh \
+	test_vxlan_vnifilter_notify.sh \
 	test_vxlan_vnifiltering.sh \
 	tfo_passive.sh \
 	traceroute.sh \
@@ -121,6 +134,7 @@ TEST_PROGS := \
 	vrf_route_leaking.sh \
 	vrf_strict_mode_test.sh \
 	xfrm_policy.sh \
+	xfrm_state.sh \
 # end of TEST_PROGS
 
 TEST_PROGS_EXTENDED := \
@@ -138,7 +152,6 @@ TEST_GEN_FILES := \
 	ip_local_port_range \
 	ipsec \
 	ipv6_flowlabel \
-	ipv6_flowlabel_mgr \
 	msg_zerocopy \
 	nettest \
 	psock_fanout \
@@ -151,7 +164,6 @@ TEST_GEN_FILES := \
 	skf_net_off \
 	so_netns_cookie \
 	so_rcv_listener \
-	so_txtime \
 	socket \
 	stress_reuseport_listen \
 	tcp_fastopen_backup_key \
@@ -170,7 +182,9 @@ TEST_GEN_PROGS := \
 	bind_timewait \
 	bind_wildcard \
 	epoll_busy_poll \
+	getsockopt_iter \
 	icmp_rfc4884 \
+	ipv6_flowlabel_mgr \
 	ipv6_fragmentation \
 	proc_net_pktgen \
 	reuseaddr_conflict \
@@ -185,6 +199,7 @@ TEST_GEN_PROGS := \
 	tap \
 	tcp_port_share \
 	tls \
+	udp_splice_checksum \
 # end of TEST_GEN_PROGS
 
 TEST_FILES := \

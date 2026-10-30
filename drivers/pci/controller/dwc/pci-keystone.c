@@ -876,7 +876,7 @@ static const struct dw_pcie_ops ks_pcie_dw_pcie_ops = {
 	.write_dbi2 = ks_pcie_am654_write_dbi2,
 };
 
-static void ks_pcie_am654_ep_init(struct dw_pcie_ep *ep)
+static int ks_pcie_am654_ep_init(struct dw_pcie_ep *ep)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_ep(ep);
 	int flags;
@@ -885,6 +885,8 @@ static void ks_pcie_am654_ep_init(struct dw_pcie_ep *ep)
 	flags = PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32;
 	dw_pcie_writel_dbi2(pci, PCI_BASE_ADDRESS_0, APP_ADDR_SPACE_0 - 1);
 	dw_pcie_writel_dbi(pci, PCI_BASE_ADDRESS_0, flags);
+
+	return 0;
 }
 
 static void ks_pcie_am654_raise_intx_irq(struct keystone_pcie *ks_pcie)
@@ -933,6 +935,18 @@ static const struct pci_epc_features ks_pcie_am654_epc_features = {
 	DWC_EPC_COMMON_FEATURES,
 	.msi_capable = true,
 	.msix_capable = true,
+	/*
+	 * TODO: This driver is the only DWC glue driver that had BAR_RESERVED
+	 * BARs, but did not call dw_pcie_ep_reset_bar() for the reserved BARs.
+	 *
+	 * To not change the existing behavior, these BARs were not migrated to
+	 * BAR_DISABLED. If this driver wants the BAR_RESERVED BARs to be
+	 * disabled, it should migrate them to BAR_DISABLED.
+	 *
+	 * If they actually should be enabled, then the driver must also define
+	 * what is behind these reserved BARs, see the definition of struct
+	 * pci_epc_bar_rsvd_region.
+	 */
 	.bar[BAR_0] = { .type = BAR_RESERVED, },
 	.bar[BAR_1] = { .type = BAR_RESERVED, },
 	.bar[BAR_2] = { .type = BAR_RESIZABLE, },
@@ -1377,13 +1391,17 @@ static int ks_pcie_fault(unsigned long addr, unsigned int fsr,
 
 static int __init ks_pcie_init(void)
 {
+	struct device_node *np;
 	/*
 	 * PCIe access errors that result into OCP errors are caught by ARM as
 	 * "External aborts"
 	 */
-	if (of_find_matching_node(NULL, ks_pcie_of_match))
+	np = of_find_matching_node(NULL, ks_pcie_of_match);
+	if (np) {
+		of_node_put(np);
 		hook_fault_code(17, ks_pcie_fault, SIGBUS, 0,
 				"Asynchronous external abort");
+	}
 
 	return platform_driver_register(&ks_pcie_driver);
 }

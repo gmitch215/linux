@@ -1375,6 +1375,14 @@ int phy_init_hw(struct phy_device *phydev)
 			return ret;
 	}
 
+	/* Re-apply autonomous EEE disable after soft reset */
+	if (phydev->autonomous_eee_disabled &&
+	    phydev->drv->disable_autonomous_eee) {
+		ret = phydev->drv->disable_autonomous_eee(phydev);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL(phy_init_hw);
@@ -1899,44 +1907,6 @@ error_put_device:
 EXPORT_SYMBOL(phy_attach_direct);
 
 /**
- * phy_attach - attach a network device to a particular PHY device
- * @dev: network device to attach
- * @bus_id: Bus ID of PHY device to attach
- * @interface: PHY device's interface
- *
- * Description: Same as phy_attach_direct() except that a PHY bus_id
- *     string is passed instead of a pointer to a struct phy_device.
- */
-struct phy_device *phy_attach(struct net_device *dev, const char *bus_id,
-			      phy_interface_t interface)
-{
-	struct phy_device *phydev;
-	struct device *d;
-	int rc;
-
-	if (!dev)
-		return ERR_PTR(-EINVAL);
-
-	/* Search the list of PHY devices on the mdio bus for the
-	 * PHY with the requested name
-	 */
-	d = bus_find_device_by_name(&mdio_bus_type, NULL, bus_id);
-	if (!d) {
-		pr_err("PHY %s not found\n", bus_id);
-		return ERR_PTR(-ENODEV);
-	}
-	phydev = to_phy_device(d);
-
-	rc = phy_attach_direct(dev, phydev, phydev->dev_flags, interface);
-	put_device(d);
-	if (rc)
-		return ERR_PTR(rc);
-
-	return phydev;
-}
-EXPORT_SYMBOL(phy_attach);
-
-/**
  * phy_detach - detach a PHY device from its network device
  * @phydev: target phy_device struct
  *
@@ -1968,6 +1938,9 @@ void phy_detach(struct phy_device *phydev)
 	if (dev) {
 		struct hwtstamp_provider *hwprov;
 
+		/* hwprov may technically be protected by ops lock but
+		 * not for devices with a phydev, see phy_link_topo_add_phy()
+		 */
 		hwprov = rtnl_dereference(dev->hwprov);
 		/* Disable timestamp if it is the one selected */
 		if (hwprov && hwprov->phydev == phydev) {
@@ -2797,6 +2770,31 @@ int genphy_read_abilities(struct phy_device *phydev)
 }
 EXPORT_SYMBOL(genphy_read_abilities);
 
+/* Some PHYs support direct C45 register access but not C22 indirect
+ * MMD access (registers 13 and 14). When discovered via C22, phylib
+ * routes MMD access through the indirect path, which won't work on
+ * these devices. These helpers bypass indirect access and use the bus
+ * C45 accessors directly.
+ */
+int genphy_read_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum)
+{
+	struct mii_bus *bus = phydev->mdio.bus;
+	int addr = phydev->mdio.addr;
+
+	return __mdiobus_c45_read(bus, addr, devnum, regnum);
+}
+EXPORT_SYMBOL(genphy_read_mmd_c45);
+
+int genphy_write_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum,
+			 u16 val)
+{
+	struct mii_bus *bus = phydev->mdio.bus;
+	int addr = phydev->mdio.addr;
+
+	return __mdiobus_c45_write(bus, addr, devnum, regnum, val);
+}
+EXPORT_SYMBOL(genphy_write_mmd_c45);
+
 /* This is used for the phy device which doesn't support the MMD extended
  * register access, but it does have side effect when we are trying to access
  * the MMD register via indirect method.
@@ -2941,6 +2939,20 @@ void phy_support_eee(struct phy_device *phydev)
 			phydev->eee_disabled_modes);
 	phydev->eee_cfg.tx_lpi_enabled = true;
 	phydev->eee_cfg.eee_enabled = true;
+
+	/* If the PHY supports autonomous EEE, disable it so the MAC can
+	 * manage LPI signaling instead. The flag is stored so it can be
+	 * re-applied after a PHY soft reset (e.g. suspend/resume).
+	 */
+	if (phydev->drv && phydev->drv->disable_autonomous_eee) {
+		int ret = phydev->drv->disable_autonomous_eee(phydev);
+
+		if (ret)
+			phydev_warn(phydev, "Failed to disable autonomous EEE: %pe\n",
+				    ERR_PTR(ret));
+		else
+			phydev->autonomous_eee_disabled = true;
+	}
 }
 EXPORT_SYMBOL(phy_support_eee);
 
@@ -3967,6 +3979,14 @@ static int __init phy_init(void)
 {
 	int rc;
 
+	rc = class_register(&mdio_bus_class);
+	if (rc)
+		return rc;
+
+	rc = bus_register(&mdio_bus_type);
+	if (rc)
+		goto err_class;
+
 	rtnl_lock();
 	ethtool_set_ethtool_phy_ops(&phy_ethtool_phy_ops);
 	phylib_register_stubs();
@@ -3995,6 +4015,9 @@ err_ethtool_phy_ops:
 	phylib_unregister_stubs();
 	ethtool_set_ethtool_phy_ops(NULL);
 	rtnl_unlock();
+	bus_unregister(&mdio_bus_type);
+err_class:
+	class_unregister(&mdio_bus_class);
 
 	return rc;
 }
@@ -4007,6 +4030,8 @@ static void __exit phy_exit(void)
 	phylib_unregister_stubs();
 	ethtool_set_ethtool_phy_ops(NULL);
 	rtnl_unlock();
+	bus_unregister(&mdio_bus_type);
+	class_unregister(&mdio_bus_class);
 }
 
 subsys_initcall(phy_init);

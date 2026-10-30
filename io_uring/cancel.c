@@ -156,9 +156,16 @@ int io_async_cancel_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		cancel->fd = READ_ONCE(sqe->fd);
 	}
 	if (cancel->flags & IORING_ASYNC_CANCEL_OP) {
+		u32 op;
+
 		if (cancel->flags & IORING_ASYNC_CANCEL_ANY)
 			return -EINVAL;
-		cancel->opcode = READ_ONCE(sqe->len);
+
+		op = READ_ONCE(sqe->len);
+		if (op >= IORING_OP_LAST)
+			return -EINVAL;
+
+		cancel->opcode = op;
 	}
 
 	return 0;
@@ -554,12 +561,10 @@ __cold bool io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
 	ret |= io_waitid_remove_all(ctx, tctx, cancel_all);
 	ret |= io_futex_remove_all(ctx, tctx, cancel_all);
 	ret |= io_uring_try_cancel_uring_cmd(ctx, tctx, cancel_all);
-	mutex_unlock(&ctx->uring_lock);
 	ret |= io_kill_timeouts(ctx, tctx, cancel_all);
+	mutex_unlock(&ctx->uring_lock);
 	if (tctx)
 		ret |= io_run_task_work() > 0;
-	else
-		ret |= flush_delayed_work(&ctx->fallback_work);
 	return ret;
 }
 
@@ -629,12 +634,11 @@ __cold void io_uring_cancel_generic(bool cancel_all, struct io_sq_data *sqd)
 		prepare_to_wait(&tctx->wait, &wait, TASK_INTERRUPTIBLE);
 		io_run_task_work();
 		io_uring_drop_tctx_refs(current);
+		/* only skip the sleep for local work this task may run */
 		xa_for_each(&tctx->xa, index, node) {
-			if (io_local_work_pending(node->ctx)) {
-				WARN_ON_ONCE(node->ctx->submitter_task &&
-					     node->ctx->submitter_task != current);
+			if (io_local_work_pending(node->ctx) &&
+			    io_allowed_defer_tw_run(node->ctx))
 				goto end_wait;
-			}
 		}
 		/*
 		 * If we've seen completions, retry without waiting. This
@@ -655,6 +659,6 @@ end_wait:
 		 */
 		atomic_dec(&tctx->in_cancel);
 		/* for exec all current's requests should be gone, kill tctx */
-		__io_uring_free(current);
+		io_uring_free_tctx(current);
 	}
 }

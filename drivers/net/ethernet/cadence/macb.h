@@ -170,6 +170,10 @@
 #define GEM_PCSANNPTX		0x021c /* PCS AN Next Page TX */
 #define GEM_PCSANNPLP		0x0220 /* PCS AN Next Page LP */
 #define GEM_PCSANEXTSTS		0x023c /* PCS AN Extended Status */
+#define GEM_RXLPI		0x0270 /* RX LPI Transitions */
+#define GEM_RXLPITIME		0x0274 /* RX LPI Time */
+#define GEM_TXLPI		0x0278 /* TX LPI Transitions */
+#define GEM_TXLPITIME		0x027c /* TX LPI Time */
 #define GEM_DCFG1		0x0280 /* Design Config 1 */
 #define GEM_DCFG2		0x0284 /* Design Config 2 */
 #define GEM_DCFG3		0x0288 /* Design Config 3 */
@@ -180,12 +184,6 @@
 #define GEM_DCFG8		0x029C /* Design Config 8 */
 #define GEM_DCFG10		0x02A4 /* Design Config 10 */
 #define GEM_DCFG12		0x02AC /* Design Config 12 */
-#define GEM_ENST_START_TIME_Q0	0x0800 /* ENST Q0 start time */
-#define GEM_ENST_START_TIME_Q1	0x0804 /* ENST Q1 start time */
-#define GEM_ENST_ON_TIME_Q0	0x0820 /* ENST Q0 on time */
-#define GEM_ENST_ON_TIME_Q1	0x0824 /* ENST Q1 on time */
-#define GEM_ENST_OFF_TIME_Q0	0x0840 /* ENST Q0 off time */
-#define GEM_ENST_OFF_TIME_Q1	0x0844 /* ENST Q1 off time */
 #define GEM_ENST_CONTROL	0x0880 /* ENST control register */
 #define GEM_USX_CONTROL		0x0A80 /* High speed PCS control register */
 #define GEM_USX_STATUS		0x0A88 /* High speed PCS status register */
@@ -305,6 +303,8 @@
 #define MACB_IRXFCS_SIZE	1
 
 /* GEM specific NCR bitfields. */
+#define GEM_TXLPIEN_OFFSET		19
+#define GEM_TXLPIEN_SIZE		1
 #define GEM_ENABLE_HS_MAC_OFFSET	31
 #define GEM_ENABLE_HS_MAC_SIZE		1
 
@@ -518,6 +518,8 @@
 #define GEM_IRQCOR_SIZE				1
 #define GEM_DBWDEF_OFFSET			25
 #define GEM_DBWDEF_SIZE				3
+#define GEM_USERIO_OFFSET			9
+#define GEM_USERIO_SIZE				1
 #define GEM_NO_PCS_OFFSET			0
 #define GEM_NO_PCS_SIZE				1
 
@@ -779,6 +781,10 @@
 #define MACB_CAPS_DMA_PTP			BIT(22)
 #define MACB_CAPS_RSC				BIT(23)
 #define MACB_CAPS_NO_LSO			BIT(24)
+#define MACB_CAPS_EEE				BIT(25)
+#define MACB_CAPS_USRIO_HAS_MII			BIT(26)
+#define MACB_CAPS_USRIO_HAS_REFCLK_SOURCE	BIT(27)
+#define MACB_CAPS_USRIO_HAS_TSUCLK_SOURCE	BIT(28)
 
 /* LSO settings */
 #define MACB_LSO_UFO_ENABLE			0x01
@@ -962,6 +968,8 @@ struct macb_dma_desc_ptp {
  *       of the frame
  * @mapping: DMA address of the skb's fragment buffer
  * @size: size of the DMA mapped buffer
+ * @fcs_len: FCS bytes appended in software, 0 or ETH_FCS_LEN, only
+ *           set for the last buffer of the frame
  * @mapped_as_page: true when buffer was mapped with skb_frag_dma_map(),
  *                  false when buffer was mapped with dma_map_single()
  */
@@ -969,6 +977,7 @@ struct macb_tx_skb {
 	struct sk_buff		*skb;
 	dma_addr_t		mapping;
 	size_t			size;
+	u8			fcs_len;
 	bool			mapped_as_page;
 };
 
@@ -1043,6 +1052,10 @@ struct gem_stats {
 	u64	rx_ip_header_checksum_errors;
 	u64	rx_tcp_checksum_errors;
 	u64	rx_udp_checksum_errors;
+	u64	rx_lpi_transitions;
+	u64	rx_lpi_time;
+	u64	tx_lpi_transitions;
+	u64	tx_lpi_time;
 };
 
 /* Describes the name and offset of an individual statistic register, as
@@ -1142,6 +1155,10 @@ static const struct gem_statistic gem_statistics[] = {
 			    GEM_BIT(NDS_RXERR)),
 	GEM_STAT_TITLE_BITS(RXUDPCCNT, "rx_udp_checksum_errors",
 			    GEM_BIT(NDS_RXERR)),
+	GEM_STAT_TITLE(RXLPI, "rx_lpi_transitions"),
+	GEM_STAT_TITLE(RXLPITIME, "rx_lpi_time"),
+	GEM_STAT_TITLE(TXLPI, "tx_lpi_transitions"),
+	GEM_STAT_TITLE(TXLPITIME, "tx_lpi_time"),
 };
 
 #define GEM_STATS_LEN ARRAY_SIZE(gem_statistics)
@@ -1187,11 +1204,11 @@ struct macb_or_gem_ops {
 
 /* MACB-PTP interface: adapt to platform needs. */
 struct macb_ptp_info {
-	void (*ptp_init)(struct net_device *ndev);
-	void (*ptp_remove)(struct net_device *ndev);
+	void (*ptp_init)(struct net_device *netdev);
+	void (*ptp_remove)(struct net_device *netdev);
 	s32 (*get_ptp_max_adj)(void);
 	unsigned int (*get_tsu_rate)(struct macb *bp);
-	int (*get_ts_info)(struct net_device *dev,
+	int (*get_ts_info)(struct net_device *netdev,
 			   struct kernel_ethtool_ts_info *info);
 	int (*get_hwtst)(struct net_device *netdev,
 			 struct kernel_hwtstamp_config *tstamp_config);
@@ -1210,7 +1227,10 @@ struct macb_usrio_config {
 	u32 rmii;
 	u32 rgmii;
 	u32 refclk;
+	u32 clken;
 	u32 hdfctlen;
+	u32 tsu_source;
+	bool refclk_default_external;
 };
 
 struct macb_config {
@@ -1303,7 +1323,7 @@ struct macb {
 	struct clk		*tx_clk;
 	struct clk		*rx_clk;
 	struct clk		*tsu_clk;
-	struct net_device	*dev;
+	struct net_device	*netdev;
 	/* Protects hw_stats and ethtool_stats */
 	spinlock_t		stats_lock;
 	union {
@@ -1357,6 +1377,11 @@ struct macb {
 
 	struct work_struct	hresp_err_bh_work;
 
+	/* EEE / LPI state */
+	bool			eee_active;
+	struct delayed_work	tx_lpi_work;
+	u32			tx_lpi_timer;
+
 	int	rx_bd_rd_prefetch;
 	int	tx_bd_rd_prefetch;
 
@@ -1378,8 +1403,8 @@ enum macb_bd_control {
 	TSTAMP_ALL_FRAMES,
 };
 
-void gem_ptp_init(struct net_device *ndev);
-void gem_ptp_remove(struct net_device *ndev);
+void gem_ptp_init(struct net_device *netdev);
+void gem_ptp_remove(struct net_device *netdev);
 void gem_ptp_txstamp(struct macb *bp, struct sk_buff *skb, struct macb_dma_desc *desc);
 void gem_ptp_rxstamp(struct macb *bp, struct sk_buff *skb, struct macb_dma_desc *desc);
 static inline void gem_ptp_do_txstamp(struct macb *bp, struct sk_buff *skb, struct macb_dma_desc *desc)
@@ -1398,14 +1423,14 @@ static inline void gem_ptp_do_rxstamp(struct macb *bp, struct sk_buff *skb, stru
 	gem_ptp_rxstamp(bp, skb, desc);
 }
 
-int gem_get_hwtst(struct net_device *dev,
+int gem_get_hwtst(struct net_device *netdev,
 		  struct kernel_hwtstamp_config *tstamp_config);
-int gem_set_hwtst(struct net_device *dev,
+int gem_set_hwtst(struct net_device *netdev,
 		  struct kernel_hwtstamp_config *tstamp_config,
 		  struct netlink_ext_ack *extack);
 #else
-static inline void gem_ptp_init(struct net_device *ndev) { }
-static inline void gem_ptp_remove(struct net_device *ndev) { }
+static inline void gem_ptp_init(struct net_device *netdev) { }
+static inline void gem_ptp_remove(struct net_device *netdev) { }
 
 static inline void gem_ptp_do_txstamp(struct macb *bp, struct sk_buff *skb, struct macb_dma_desc *desc) { }
 static inline void gem_ptp_do_rxstamp(struct macb *bp, struct sk_buff *skb, struct macb_dma_desc *desc) { }
@@ -1444,6 +1469,13 @@ static inline bool macb_dma_ptp(struct macb *bp)
 {
 	return IS_ENABLED(CONFIG_MACB_USE_HWSTAMP) &&
 	       bp->caps & MACB_CAPS_DMA_PTP;
+}
+
+static inline void macb_queue_isr_clear(struct macb *bp,
+					struct macb_queue *queue, u32 value)
+{
+	if (bp->caps & MACB_CAPS_ISR_CLEAR_ON_WRITE)
+		queue_writel(queue, ISR, value);
 }
 
 /**

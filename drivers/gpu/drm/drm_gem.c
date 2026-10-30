@@ -38,7 +38,7 @@
 #include <linux/mman.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
-#include <linux/pagevec.h>
+#include <linux/folio_batch.h>
 #include <linux/sched/mm.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
@@ -232,8 +232,7 @@ void drm_gem_private_object_init(struct drm_device *dev,
 	if (!obj->resv)
 		obj->resv = &obj->_resv;
 
-	if (drm_core_check_feature(dev, DRIVER_GEM_GPUVA))
-		drm_gem_gpuva_init(obj);
+	drm_gem_gpuva_init(obj);
 
 	drm_vma_node_reset(&obj->vma_node);
 	INIT_LIST_HEAD(&obj->lru_node);
@@ -784,7 +783,7 @@ EXPORT_SYMBOL(drm_gem_put_pages);
 static int objects_lookup(struct drm_file *filp, u32 *handle, int count,
 			  struct drm_gem_object **objs)
 {
-	int i, ret = 0;
+	int i;
 	struct drm_gem_object *obj;
 
 	spin_lock(&filp->table_lock);
@@ -792,16 +791,23 @@ static int objects_lookup(struct drm_file *filp, u32 *handle, int count,
 	for (i = 0; i < count; i++) {
 		/* Check if we currently have a reference on the object */
 		obj = idr_find(&filp->object_idr, handle[i]);
-		if (!obj) {
-			ret = -ENOENT;
-			break;
-		}
+		if (!obj)
+			goto err;
+
 		drm_gem_object_get(obj);
 		objs[i] = obj;
 	}
+
+	spin_unlock(&filp->table_lock);
+	return 0;
+
+err:
 	spin_unlock(&filp->table_lock);
 
-	return ret;
+	while (i--)
+		drm_gem_object_put(objs[i]);
+
+	return -ENOENT;
 }
 
 /**
@@ -814,13 +820,14 @@ static int objects_lookup(struct drm_file *filp, u32 *handle, int count,
  * Takes an array of userspace handles and returns a newly allocated array of
  * GEM objects.
  *
+ * After a successful lookup GEM objects need to be released using
+ * drm_gem_object_put() and the array returned in @objs_out must be freed using
+ * kvfree().
+ *
  * For a single handle lookup, use drm_gem_object_lookup().
  *
- * Returns:
- * @objs filled in with GEM object pointers. Returned GEM objects need to be
- * released with drm_gem_object_put(). -ENOENT is returned on a lookup
- * failure. 0 is returned on success.
- *
+ * Return:
+ * Zero on success or a negative error code.
  */
 int drm_gem_objects_lookup(struct drm_file *filp, void __user *bo_handles,
 			   int count, struct drm_gem_object ***objs_out)
@@ -829,24 +836,34 @@ int drm_gem_objects_lookup(struct drm_file *filp, void __user *bo_handles,
 	u32 *handles;
 	int ret;
 
+	*objs_out = NULL;
+
 	if (!count)
 		return 0;
 
-	objs = kvmalloc_objs(struct drm_gem_object *, count,
-			     GFP_KERNEL | __GFP_ZERO);
+	objs = kvmalloc_objs(*objs, count);
 	if (!objs)
 		return -ENOMEM;
 
-	*objs_out = objs;
-
 	handles = vmemdup_array_user(bo_handles, count, sizeof(u32));
-	if (IS_ERR(handles))
-		return PTR_ERR(handles);
+	if (IS_ERR(handles)) {
+		ret = PTR_ERR(handles);
+		goto err_free_objs;
+	}
 
 	ret = objects_lookup(filp, handles, count, objs);
-	kvfree(handles);
-	return ret;
+	if (ret)
+		goto err_free_handles;
 
+	kvfree(handles);
+	*objs_out = objs;
+	return 0;
+
+err_free_handles:
+	kvfree(handles);
+err_free_objs:
+	kvfree(objs);
+	return ret;
 }
 EXPORT_SYMBOL(drm_gem_objects_lookup);
 
@@ -1234,7 +1251,7 @@ int drm_gem_mmap_obj(struct drm_gem_object *obj, unsigned long obj_size,
 		}
 
 		vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-		vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+		vma->vm_page_prot = pgprot_writecombine(vma_get_page_prot(vma));
 		vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
 	}
 
@@ -1695,6 +1712,16 @@ drm_gem_lru_scan(struct drm_device *dev,
 			 */
 			WARN_ON(obj->lru == &still_in_lru);
 			WARN_ON(obj->lru == lru);
+		} else if (obj->lru == &still_in_lru) {
+			/*
+			 * If the object wasn't moved and wasn't shrunk either,
+			 * it's still remaining as reclaimable. Note that
+			 * obj->lru is supposed to be checked with the LRU lock
+			 * held for an accurate result, but we don't care about
+			 * accuracy here. Worst thing that could happen is an
+			 * extra scan.
+			 */
+			*remaining += obj->size >> PAGE_SHIFT;
 		}
 
 		dma_resv_unlock(obj->resv);

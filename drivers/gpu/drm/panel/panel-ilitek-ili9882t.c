@@ -13,6 +13,7 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
+#include <drm/drm_of.h>
 #include <drm/drm_panel.h>
 
 #include <video/mipi_display.h>
@@ -592,7 +593,7 @@ static int ili9882t_unprepare(struct drm_panel *panel)
 {
 	struct ili9882t *ili = to_ili9882t(panel);
 
-	gpiod_set_value(ili->enable_gpio, 0);
+	gpiod_set_value_cansleep(ili->enable_gpio, 0);
 	usleep_range(1000, 2000);
 	regulator_disable(ili->avee);
 	regulator_disable(ili->avdd);
@@ -608,7 +609,7 @@ static int ili9882t_prepare(struct drm_panel *panel)
 	struct ili9882t *ili = to_ili9882t(panel);
 	int ret;
 
-	gpiod_set_value(ili->enable_gpio, 0);
+	gpiod_set_value_cansleep(ili->enable_gpio, 0);
 	usleep_range(1000, 1500);
 
 	ret = regulator_enable(ili->pp3300);
@@ -638,11 +639,11 @@ static int ili9882t_prepare(struct drm_panel *panel)
 	}
 	usleep_range(1000, 2000);
 
-	gpiod_set_value(ili->enable_gpio, 1);
+	gpiod_set_value_cansleep(ili->enable_gpio, 1);
 	usleep_range(1000, 2000);
-	gpiod_set_value(ili->enable_gpio, 0);
+	gpiod_set_value_cansleep(ili->enable_gpio, 0);
 	msleep(50);
-	gpiod_set_value(ili->enable_gpio, 1);
+	gpiod_set_value_cansleep(ili->enable_gpio, 1);
 	usleep_range(6000, 10000);
 
 	ret = ili->desc->init(ili);
@@ -652,7 +653,7 @@ static int ili9882t_prepare(struct drm_panel *panel)
 	return 0;
 
 poweroff:
-	gpiod_set_value(ili->enable_gpio, 0);
+	gpiod_set_value_cansleep(ili->enable_gpio, 0);
 	regulator_disable(ili->avee);
 poweroffavdd:
 	regulator_disable(ili->avdd);
@@ -793,9 +794,9 @@ static int ili9882t_add(struct ili9882t *ili)
 		return PTR_ERR(ili->enable_gpio);
 	}
 
-	gpiod_set_value(ili->enable_gpio, 0);
+	gpiod_set_value_cansleep(ili->enable_gpio, 0);
 
-	err = of_drm_get_panel_orientation(dev->of_node, &ili->orientation);
+	err = drm_of_get_panel_orientation(dev->of_node, &ili->orientation);
 	if (err < 0) {
 		dev_err(dev, "%pOF: failed to get orientation %d\n", dev->of_node, err);
 		return err;

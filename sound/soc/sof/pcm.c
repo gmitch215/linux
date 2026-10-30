@@ -62,7 +62,7 @@ void snd_sof_pcm_period_elapsed(struct snd_pcm_substream *substream)
 	 * To avoid sending IPC before the previous IPC is handled, we
 	 * schedule delayed work here to call the snd_pcm_period_elapsed().
 	 */
-	schedule_work(&spcm->stream[substream->stream].period_elapsed_work);
+	queue_work(system_highpri_wq, &spcm->stream[substream->stream].period_elapsed_work);
 }
 EXPORT_SYMBOL(snd_sof_pcm_period_elapsed);
 
@@ -360,8 +360,8 @@ static int sof_pcm_prepare(struct snd_soc_component *component,
 	platform_params = &spcm->platform_params[substream->stream];
 	ret = sof_widget_list_setup(sdev, spcm, params, platform_params, dir);
 	if (ret < 0) {
-		dev_err(sdev->dev, "failed widget list set up for pcm %d dir %d\n",
-			spcm->pcm.pcm_id, dir);
+		dev_err(sdev->dev, "failed widget list set up for pcm %d dir %u\n",
+			le32_to_cpu(spcm->pcm.pcm_id), dir);
 		spcm->stream[dir].list = NULL;
 		snd_soc_dapm_dai_free_widgets(&list);
 		return ret;
@@ -651,8 +651,8 @@ static int sof_pcm_new(struct snd_soc_component *component,
 		return 0;
 	}
 
-	dev_dbg(spcm->scomp->dev, "pcm%u (%s): Entry: pcm_construct\n",
-		spcm->pcm.pcm_id, spcm->pcm.pcm_name);
+	dev_dbg(spcm->scomp->dev, "pcm%u (%s): Entry: pcm_new\n",
+		le32_to_cpu(spcm->pcm.pcm_id), spcm->pcm.pcm_name);
 
 	/* do we need to pre-allocate playback audio buffer pages */
 	if (!spcm->pcm.playback)
@@ -850,7 +850,7 @@ void snd_sof_new_platform_drv(struct snd_sof_dev *sdev)
 	pd->compress_ops = &sof_compressed_ops;
 #endif
 
-	pd->pcm_construct = sof_pcm_new;
+	pd->pcm_new = sof_pcm_new;
 	pd->ignore_machine = drv_name;
 	pd->be_pcm_base = SOF_BE_PCM_BASE;
 	pd->use_dai_pcm_id = true;

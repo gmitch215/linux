@@ -6,7 +6,7 @@
 #include "bpf_misc.h"
 #include "../../../include/linux/filter.h"
 
-#if defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64)
+#if defined(__TARGET_ARCH_x86) || defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_powerpc)
 
 #define DEFINE_SIMPLE_JUMP_TABLE_PROG(NAME, SRC_REG, OFF, IMM, OUTCOME)	\
 									\
@@ -46,6 +46,54 @@ DEFINE_SIMPLE_JUMP_TABLE_PROG(ok,                          BPF_REG_0, 0, 0, __su
 DEFINE_SIMPLE_JUMP_TABLE_PROG(reserved_field_src_reg,      BPF_REG_1, 0, 0, __failure __msg("BPF_JA|BPF_X uses reserved fields"))
 DEFINE_SIMPLE_JUMP_TABLE_PROG(reserved_field_non_zero_off, BPF_REG_0, 1, 0, __failure __msg("BPF_JA|BPF_X uses reserved fields"))
 DEFINE_SIMPLE_JUMP_TABLE_PROG(reserved_field_non_zero_imm, BPF_REG_0, 0, 1, __failure __msg("BPF_JA|BPF_X uses reserved fields"))
+
+#define DEFINE_TERMINAL_GOTOX_PROG(NAME, BASE)			\
+	__naked void NAME(void)					\
+	{							\
+	asm volatile ("						\
+	.pushsection .jumptables,\"\",@progbits;		\
+jt0_%=:							\
+	.quad ret0_%= - " BASE ";				\
+	.size jt0_%=, 8;					\
+	.global jt0_%=;						\
+	.popsection;						\
+								\
+	r0 = jt0_%= ll;						\
+	r0 = *(u64 *)(r0 + 0);					\
+	goto end_%=;						\
+ret0_%=:							\
+	r0 = 0;							\
+	exit;							\
+end_%=:							\
+	.8byte %[gotox_r0];					\
+"	:							\
+	: __imm_insn(gotox_r0, BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X,	\
+					    BPF_REG_0, 0, 0, 0))	\
+	: __clobber_all);					\
+	}
+
+SEC("socket")
+__success __retval(0)
+DEFINE_TERMINAL_GOTOX_PROG(jump_table_terminal_gotox, "socket")
+
+static __noinline __used
+DEFINE_TERMINAL_GOTOX_PROG(terminal_gotox_subprog1, ".text")
+
+static __noinline __used int terminal_gotox_subprog2(void)
+{
+	return 0;
+}
+
+SEC("socket")
+__success __retval(0)
+__naked void jump_table_terminal_gotox_subprog(void)
+{
+	asm volatile ("						\
+	call terminal_gotox_subprog1;				\
+	call terminal_gotox_subprog2;				\
+	exit;							\
+"	::: __clobber_all);
+}
 
 /*
  * Gotox is forbidden when there is no jump table loaded
@@ -131,7 +179,7 @@ DEFINE_INVALID_SIZE_PROG(u16, __failure __msg("Invalid read of 2 bytes from insn
 DEFINE_INVALID_SIZE_PROG(u8,  __failure __msg("Invalid read of 1 bytes from insn_array"))
 
 SEC("socket")
-__failure __msg("misaligned value access off 0+1+0 size 8")
+__failure __msg("misaligned value access off 1+0 size 8")
 __naked void jump_table_misaligned_access(void)
 {
 	asm volatile ("						\
@@ -187,7 +235,7 @@ jt0_%=:								\
 }
 
 SEC("socket")
-__failure __msg("invalid access to map value, value_size=16 off=-24 size=8")
+__failure __msg("R0 min value is negative")
 __naked void jump_table_invalid_mem_acceess_neg(void)
 {
 	asm volatile ("						\
@@ -384,6 +432,31 @@ jt0_%=:								\
 	: __clobber_all);
 }
 
-#endif /* __TARGET_ARCH_x86 || __TARGET_ARCH_arm64 */
+/* check valid spill/fill, ptr to insn */
+SEC("socket")
+__success
+__naked void spill_fill_ptr_to_insn(void)
+{
+	asm volatile (
+	".pushsection .jumptables,\"\",@progbits;"
+	"jt0_%=:"
+	".quad ret0_%= - socket;"
+	".size jt0_%=, 8;"
+	".global jt0_%=;"
+	".popsection;"
+	"r0 = jt0_%= ll;"
+	"r0 = *(u64 *)(r0 + 0);"
+	"*(u64 *)(r10 - 8) = r0;"
+	"r0 = *(u64 *)(r10 - 8);"
+	".8byte %[gotox_r0];"
+	"ret0_%=:"
+	"r0 = 0;"
+	"exit;"
+	:
+	: __imm_insn(gotox_r0, BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, BPF_REG_0, 0, 0, 0))
+	: __clobber_all);
+}
+
+#endif /* __TARGET_ARCH_x86 || __TARGET_ARCH_arm64 || __TARGET_ARCH_powerpc*/
 
 char _license[] SEC("license") = "GPL";

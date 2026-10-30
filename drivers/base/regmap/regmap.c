@@ -1182,9 +1182,9 @@ err:
 }
 EXPORT_SYMBOL_GPL(__regmap_init);
 
-static void devm_regmap_release(struct device *dev, void *res)
+static void devm_regmap_release(void *regmap)
 {
-	regmap_exit(*(struct regmap **)res);
+	regmap_exit(regmap);
 }
 
 struct regmap *__devm_regmap_init(struct device *dev,
@@ -1194,20 +1194,17 @@ struct regmap *__devm_regmap_init(struct device *dev,
 				  struct lock_class_key *lock_key,
 				  const char *lock_name)
 {
-	struct regmap **ptr, *regmap;
-
-	ptr = devres_alloc(devm_regmap_release, sizeof(*ptr), GFP_KERNEL);
-	if (!ptr)
-		return ERR_PTR(-ENOMEM);
+	struct regmap *regmap;
+	int ret;
 
 	regmap = __regmap_init(dev, bus, bus_context, config,
 			       lock_key, lock_name);
-	if (!IS_ERR(regmap)) {
-		*ptr = regmap;
-		devres_add(dev, ptr);
-	} else {
-		devres_free(ptr);
-	}
+	if (IS_ERR(regmap))
+		return regmap;
+
+	ret = devm_add_action_or_reset(dev, devm_regmap_release, regmap);
+	if (ret)
+		return ERR_PTR(ret);
 
 	return regmap;
 }
@@ -1425,8 +1422,8 @@ int regmap_reinit_cache(struct regmap *map, const struct regmap_config *config)
 {
 	int ret;
 
-	regcache_exit(map);
 	regmap_debugfs_exit(map);
+	regcache_exit(map);
 
 	map->max_register = config->max_register;
 	map->max_register_is_set = map->max_register ?: config->max_register_is_0;
@@ -1443,12 +1440,16 @@ int regmap_reinit_cache(struct regmap *map, const struct regmap_config *config)
 	if (ret)
 		return ret;
 
-	regmap_debugfs_init(map);
-
 	map->cache_bypass = false;
 	map->cache_only = false;
 
-	return regcache_init(map, config);
+	ret = regcache_init(map, config);
+	if (ret)
+		return ret;
+
+	regmap_debugfs_init(map);
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(regmap_reinit_cache);
 
@@ -1462,9 +1463,8 @@ void regmap_exit(struct regmap *map)
 	struct regmap_async *async;
 
 	regmap_detach_dev(map->dev, map);
-	regcache_exit(map);
-
 	regmap_debugfs_exit(map);
+	regcache_exit(map);
 	regmap_range_exit(map);
 	if (map->bus && map->bus->free_context)
 		map->bus->free_context(map->bus_context);
@@ -3260,6 +3260,9 @@ static int _regmap_update_bits(struct regmap *map, unsigned int reg,
 		*change = false;
 
 	if (regmap_volatile(map, reg) && map->reg_update_bits) {
+		if (map->cache_only)
+			return -EBUSY;
+
 		reg = regmap_reg_addr(map, reg);
 		ret = map->reg_update_bits(map->bus_context, reg, mask, val);
 		if (ret == 0 && change)

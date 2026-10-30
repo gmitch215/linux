@@ -68,12 +68,8 @@ enum adreno_family {
 /* Helper for formating the chip_id in the way that userspace tools like
  * crashdec expect.
  */
-#define ADRENO_CHIPID_FMT "u.%u.%u.%u"
-#define ADRENO_CHIPID_ARGS(_c) \
-	(((_c) >> 24) & 0xff), \
-	(((_c) >> 16) & 0xff), \
-	(((_c) >> 8)  & 0xff), \
-	((_c) & 0xff)
+#define ADRENO_CHIPID_FMT "08x"
+#define ADRENO_CHIPID_ARGS(_c) (_c)
 
 struct adreno_gpu;
 
@@ -84,6 +80,7 @@ struct adreno_gpu_funcs {
 	void (*bus_halt)(struct adreno_gpu *adreno_gpu, bool gx_off);
 	int (*mmu_fault_handler)(void *arg, unsigned long iova, int flags, void *data);
 	bool (*gx_is_on)(struct adreno_gpu *adreno_gpu);
+	bool (*aqe_is_enabled)(struct adreno_gpu *adreno_gpu);
 };
 
 struct adreno_reglist {
@@ -239,12 +236,7 @@ struct adreno_gpu {
 	/* firmware: */
 	const struct firmware *fw[ADRENO_FW_MAX];
 
-	/*
-	 * The migration to the central UBWC config db is still in flight - keep
-	 * a copy containing some local fixups until that's done.
-	 */
 	const struct qcom_ubwc_cfg_data *ubwc_config;
-	struct qcom_ubwc_cfg_data _ubwc_config;
 
 	/*
 	 * Register offsets are different between some GPUs.
@@ -570,6 +562,11 @@ static inline int adreno_is_x185(struct adreno_gpu *gpu)
 	return gpu->info->chip_ids[0] == 0x43050c01;
 }
 
+static inline int adreno_is_a722(struct adreno_gpu *gpu)
+{
+	return gpu->info->chip_ids[0] == 0x43020100;
+}
+
 static inline int adreno_is_a740_family(struct adreno_gpu *gpu)
 {
 	if (WARN_ON_ONCE(!gpu->info))
@@ -593,6 +590,11 @@ static inline int adreno_is_a7xx(struct adreno_gpu *gpu)
 static inline int adreno_is_a8xx(struct adreno_gpu *gpu)
 {
 	return gpu->info->family >= ADRENO_8XX_GEN1;
+}
+
+static inline int adreno_is_a810(struct adreno_gpu *gpu)
+{
+	return gpu->info->chip_ids[0] == 0x44010000;
 }
 
 static inline int adreno_is_x285(struct adreno_gpu *gpu)

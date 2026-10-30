@@ -413,7 +413,6 @@ void __init setup_arch(char **cmdline_p)
 	uml_dtb_init();
 	read_initrd();
 
-	paging_init();
 	strscpy(boot_command_line, command_line, COMMAND_LINE_SIZE);
 	*cmdline_p = command_line;
 	setup_hostinfo(host_info, sizeof host_info);
@@ -451,18 +450,6 @@ void apply_fineibt(s32 *start_retpoline, s32 *end_retpoline,
 void apply_alternatives(struct alt_instr *start, struct alt_instr *end)
 {
 }
-
-#if IS_ENABLED(CONFIG_SMP)
-void alternatives_smp_module_add(struct module *mod, char *name,
-				 void *locks, void *locks_end,
-				 void *text,  void *text_end)
-{
-}
-
-void alternatives_smp_module_del(struct module *mod)
-{
-}
-#endif
 
 void *text_poke(void *addr, const void *opcode, size_t len)
 {

@@ -3,6 +3,7 @@
 #define IOU_CORE_H
 
 #include <linux/errno.h>
+#include <linux/file.h>
 #include <linux/lockdep.h>
 #include <linux/resume_user_mode.h>
 #include <linux/poll.h>
@@ -185,6 +186,7 @@ void io_req_track_inflight(struct io_kiocb *req);
 struct file *io_file_get_normal(struct io_kiocb *req, int fd);
 struct file *io_file_get_fixed(struct io_kiocb *req, int fd,
 			       unsigned issue_flags);
+struct file *io_uring_ctx_get_file(unsigned int fd, bool registered);
 
 void io_req_task_queue(struct io_kiocb *req);
 void io_req_task_complete(struct io_tw_req tw_req, io_tw_token_t tw);
@@ -194,7 +196,7 @@ __cold void io_uring_drop_tctx_refs(struct task_struct *task);
 
 int io_ring_add_registered_file(struct io_uring_task *tctx, struct file *file,
 				     int start, int end);
-void io_req_queue_iowq(struct io_kiocb *req);
+void io_queue_iowq(struct io_kiocb *req);
 
 int io_poll_issue(struct io_kiocb *req, io_tw_token_t tw);
 int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr);
@@ -212,6 +214,7 @@ bool __io_alloc_req_refill(struct io_ring_ctx *ctx);
 
 void io_activate_pollwq(struct io_ring_ctx *ctx);
 void io_restriction_clone(struct io_restriction *dst, struct io_restriction *src);
+void io_poison_req(struct io_kiocb *req);
 
 static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 {
@@ -223,7 +226,7 @@ static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 
 	if (ctx->flags & IORING_SETUP_IOPOLL) {
 		lockdep_assert_held(&ctx->uring_lock);
-	} else if (!ctx->task_complete) {
+	} else if (!(ctx->int_flags & IO_RING_F_TASK_COMPLETE)) {
 		lockdep_assert_held(&ctx->completion_lock);
 	} else if (ctx->submitter_task) {
 		/*
@@ -240,7 +243,7 @@ static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 
 static inline bool io_is_compat(struct io_ring_ctx *ctx)
 {
-	return IS_ENABLED(CONFIG_COMPAT) && unlikely(ctx->compat);
+	return IS_ENABLED(CONFIG_COMPAT) && unlikely(ctx->int_flags & IO_RING_F_COMPAT);
 }
 
 static inline void io_submit_flush_completions(struct io_ring_ctx *ctx)
@@ -311,7 +314,7 @@ static __always_inline bool io_fill_cqe_req(struct io_ring_ctx *ctx,
 	}
 
 	if (trace_io_uring_complete_enabled())
-		trace_io_uring_complete(req->ctx, req, cqe);
+		trace_call__io_uring_complete(req->ctx, req, cqe);
 	return true;
 }
 
@@ -494,10 +497,12 @@ static inline void io_req_complete_defer(struct io_kiocb *req)
 	wq_list_add_tail(&req->comp_list, &state->compl_reqs);
 }
 
+#define SHOULD_FLUSH_MASK	(IO_RING_F_OFF_TIMEOUT_USED | \
+				 IO_RING_F_HAS_EVFD | IO_RING_F_POLL_ACTIVATED)
+
 static inline void io_commit_cqring_flush(struct io_ring_ctx *ctx)
 {
-	if (unlikely(ctx->off_timeout_used ||
-		     ctx->has_evfd || ctx->poll_activated))
+	if (unlikely(data_race(ctx->int_flags) & SHOULD_FLUSH_MASK))
 		__io_commit_cqring_flush(ctx);
 }
 

@@ -12,6 +12,7 @@
 
 #include "abi/guc_actions_abi.h"
 #include "abi/guc_errors_abi.h"
+#include "abi/guc_klvs_abi.h"
 #include "regs/xe_gt_regs.h"
 #include "regs/xe_gtt_defs.h"
 #include "regs/xe_guc_regs.h"
@@ -35,11 +36,13 @@
 #include "xe_guc_klv_helpers.h"
 #include "xe_guc_log.h"
 #include "xe_guc_pc.h"
+#include "xe_guc_rc.h"
 #include "xe_guc_relay.h"
 #include "xe_guc_submit.h"
 #include "xe_memirq.h"
 #include "xe_mmio.h"
 #include "xe_platform_types.h"
+#include "xe_sleep.h"
 #include "xe_sriov.h"
 #include "xe_sriov_pf_migration.h"
 #include "xe_uc.h"
@@ -95,6 +98,17 @@ static u32 guc_ctl_feature_flags(struct xe_guc *guc)
 
 	if (xe_guc_using_main_gamctrl_queues(guc))
 		flags |= GUC_CTL_MAIN_GAMCTRL_QUEUES;
+
+	if (xe_device_is_l2_flush_optimized(xe) && xe_gt_is_media_type(guc_to_gt(guc)))
+		flags |= GUC_CTL_ENABLE_L2FLUSH_OPT;
+
+	/*
+	 * On GuC firmware 70.66 and above, the GUC_FEATURE_KLV_DISABLE_MULTI_QUEUE
+	 * Feature KLV is used instead.
+	 */
+	if (!xe_configfs_get_enable_multi_queue(to_pci_dev(xe->drm.dev)) &&
+	    !GUC_FIRMWARE_VER_AT_LEAST(guc, 70, 66))
+		flags |= GUC_CTL_DISABLE_MULTI_QUEUE;
 
 	return flags;
 }
@@ -210,9 +224,6 @@ static u32 guc_ctl_wa_flags(struct xe_guc *guc)
 	if (XE_GT_WA(gt, 18020744125) &&
 	    !xe_hw_engine_mask_per_class(gt, XE_ENGINE_CLASS_RENDER))
 		flags |= GUC_WA_RCS_REGS_IN_CCS_REGS_LIST;
-
-	if (XE_GT_WA(gt, 1509372804))
-		flags |= GUC_WA_RENDER_RST_RC6_EXIT;
 
 	if (XE_GT_WA(gt, 14018913170))
 		flags |= GUC_WA_ENABLE_TSC_CHECK_ON_RC6;
@@ -639,6 +650,15 @@ int xe_guc_opt_in_features_enable(struct xe_guc *guc)
 	if (GUC_SUBMIT_VER(guc) >= MAKE_GUC_VER(1, 7, 0))
 		klvs[count++] = PREP_GUC_KLV_TAG(OPT_IN_FEATURE_EXT_CAT_ERR_TYPE);
 
+	/*
+	 * The uncorrectable local error notification opt-in was added in
+	 * GuC v70.38.0, which maps to compatibility version v1.18.0.
+	 */
+	if (GUC_SUBMIT_VER(guc) >= MAKE_GUC_VER(1, 18, 0) &&
+	    guc_to_gt(guc)->info.has_uncorrectable_error_reporting)
+		klvs[count++] =
+			PREP_GUC_KLV_TAG(OPT_IN_FEATURE_UNCORRECTABLE_LOCAL_ERROR_NOTIFICATION);
+
 	if (supports_dynamic_ics(guc))
 		klvs[count++] = PREP_GUC_KLV_TAG(OPT_IN_FEATURE_DYNAMIC_INHIBIT_CONTEXT_SWITCH);
 
@@ -666,6 +686,13 @@ static void guc_fini_hw(void *arg)
 		xe_uc_sanitize_reset(&guc_to_gt(guc)->uc);
 
 	guc_g2g_fini(guc);
+}
+
+static void vf_guc_fini_hw(void *arg)
+{
+	struct xe_guc *guc = arg;
+
+	xe_gt_sriov_vf_reset(guc_to_gt(guc));
 }
 
 /**
@@ -771,7 +798,19 @@ int xe_guc_init(struct xe_guc *guc)
 	if (GUC_SUBMIT_VER(guc) < MAKE_GUC_VER(1, 14, 0))
 		xe->info.has_page_reclaim_hw_assist = false;
 
+	/* Disable indirect_ring_state if missing GuC 70.53+ WA 14025515070. */
+	if (gt->info.has_indirect_ring_state &&
+	    XE_GT_WA(gt, 14025515070) &&
+	    GUC_SUBMIT_VER(guc) < MAKE_GUC_VER(1, 26, 0)) {
+		gt->info.has_indirect_ring_state = 0;
+		xe_gt_notice(gt, "indirect ring state requires WA in GuC submit ver 1.26+\n");
+	}
+
 	if (IS_SRIOV_VF(xe)) {
+		ret = devm_add_action_or_reset(xe->drm.dev, vf_guc_fini_hw, guc);
+		if (ret)
+			goto out;
+
 		ret = xe_guc_ct_init(&guc->ct);
 		if (ret)
 			goto out;
@@ -869,6 +908,10 @@ int xe_guc_init_post_hwconfig(struct xe_guc *guc)
 	if (ret)
 		return ret;
 
+	ret = xe_guc_rc_init(guc);
+	if (ret)
+		return ret;
+
 	ret = xe_guc_engine_activity_init(guc);
 	if (ret)
 		return ret;
@@ -900,6 +943,41 @@ int xe_guc_post_load_init(struct xe_guc *guc)
 	return xe_guc_submit_enable(guc);
 }
 
+/*
+ * Wa_14025883347: Prevent GuC firmware DMA failures during GuC-only reset by ensuring
+ * SRAM save/restore operations are complete before reset.
+ */
+static void guc_prevent_fw_dma_failure_on_reset(struct xe_guc *guc)
+{
+	struct xe_gt *gt = guc_to_gt(guc);
+	u32 boot_hash_chk, guc_status, sram_status;
+	int ret;
+
+	guc_status = xe_mmio_read32(&gt->mmio, GUC_STATUS);
+	if (guc_status & GS_MIA_IN_RESET)
+		return;
+
+	boot_hash_chk = xe_mmio_read32(&gt->mmio, BOOT_HASH_CHK);
+	if (!(boot_hash_chk & GUC_BOOT_UKERNEL_VALID))
+		return;
+
+	/* Disable idle flow during reset (GuC reset re-enables it automatically) */
+	xe_mmio_rmw32(&gt->mmio, GUC_MAX_IDLE_COUNT, 0, GUC_IDLE_FLOW_DISABLE);
+
+	ret = xe_mmio_wait32(&gt->mmio, GUC_STATUS, GS_UKERNEL_MASK,
+			     FIELD_PREP(GS_UKERNEL_MASK, XE_GUC_LOAD_STATUS_READY),
+			     100000, &guc_status, false);
+	if (ret)
+		xe_gt_warn(gt, "GuC not ready after disabling idle flow (GUC_STATUS: 0x%x)\n",
+			   guc_status);
+
+	ret = xe_mmio_wait32(&gt->mmio, GUC_SRAM_STATUS, GUC_SRAM_HANDLING_MASK,
+			     0, 5000, &sram_status, false);
+	if (ret)
+		xe_gt_warn(gt, "SRAM handling not complete (GUC_SRAM_STATUS: 0x%x)\n",
+			   sram_status);
+}
+
 int xe_guc_reset(struct xe_guc *guc)
 {
 	struct xe_gt *gt = guc_to_gt(guc);
@@ -911,6 +989,9 @@ int xe_guc_reset(struct xe_guc *guc)
 
 	if (IS_SRIOV_VF(gt_to_xe(gt)))
 		return xe_gt_sriov_vf_bootstrap(gt);
+
+	if (XE_GT_WA(gt, 14025883347))
+		guc_prevent_fw_dma_failure_on_reset(guc);
 
 	xe_mmio_write32(mmio, GDRST, GRDOM_GUC);
 
@@ -1410,17 +1491,21 @@ int xe_guc_auth_huc(struct xe_guc *guc, u32 rsa_addr)
 	return xe_guc_ct_send_block(&guc->ct, action, ARRAY_SIZE(action));
 }
 
+#define MAX_RETRIES_ON_FLR	2
+#define MIN_SLEEP_MS_ON_FLR	256
+
 int xe_guc_mmio_send_recv(struct xe_guc *guc, const u32 *request,
 			  u32 len, u32 *response_buf)
 {
 	struct xe_device *xe = guc_to_xe(guc);
 	struct xe_gt *gt = guc_to_gt(guc);
 	struct xe_mmio *mmio = &gt->mmio;
-	u32 header, reply;
 	struct xe_reg reply_reg = xe_gt_is_media_type(gt) ?
 		MED_VF_SW_FLAG(0) : VF_SW_FLAG(0);
 	const u32 LAST_INDEX = VF_SW_FLAG_COUNT - 1;
-	bool lost = false;
+	unsigned int sleep_period_ms = 1;
+	unsigned int lost = 0;
+	u32 header;
 	int ret;
 	int i;
 
@@ -1452,21 +1537,25 @@ retry:
 
 	ret = xe_mmio_wait32(mmio, reply_reg, GUC_HXG_MSG_0_ORIGIN,
 			     FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_GUC),
-			     50000, &reply, false);
+			     50000, &header, false);
 	if (ret) {
 		/* scratch registers might be cleared during FLR, try once more */
-		if (!reply && !lost) {
+		if (!header) {
+			if (++lost > MAX_RETRIES_ON_FLR) {
+				xe_gt_err(gt, "GuC mmio request %#x: lost, too many retries %u\n",
+					  request[0], lost);
+				return -ENOLINK;
+			}
 			xe_gt_dbg(gt, "GuC mmio request %#x: lost, trying again\n", request[0]);
-			lost = true;
+			xe_sleep_relaxed_ms(MIN_SLEEP_MS_ON_FLR);
 			goto retry;
 		}
 timeout:
 		xe_gt_err(gt, "GuC mmio request %#x: no reply %#x\n",
-			  request[0], reply);
+			  request[0], header);
 		return ret;
 	}
 
-	header = xe_mmio_read32(mmio, reply_reg);
 	if (FIELD_GET(GUC_HXG_MSG_0_TYPE, header) ==
 	    GUC_HXG_TYPE_NO_RESPONSE_BUSY) {
 		/*
@@ -1502,6 +1591,8 @@ timeout:
 
 		xe_gt_dbg(gt, "GuC mmio request %#x: retrying, reason %#x\n",
 			  request[0], reason);
+
+		xe_sleep_exponential_ms(&sleep_period_ms, 256);
 		goto retry;
 	}
 
@@ -1628,13 +1719,8 @@ void xe_guc_reset_wait(struct xe_guc *guc)
 
 void xe_guc_stop_prepare(struct xe_guc *guc)
 {
-	if (!IS_SRIOV_VF(guc_to_xe(guc))) {
-		int err;
-
-		err = xe_guc_pc_stop(&guc->pc);
-		xe_gt_WARN(guc_to_gt(guc), err, "Failed to stop GuC PC: %pe\n",
-			   ERR_PTR(err));
-	}
+	if (!IS_SRIOV_VF(guc_to_xe(guc)))
+		xe_guc_pc_stop(&guc->pc);
 }
 
 void xe_guc_stop(struct xe_guc *guc)
@@ -1776,6 +1862,58 @@ bool xe_guc_using_main_gamctrl_queues(struct xe_guc *guc)
 	}
 
 	return GT_VER(gt) >= 35;
+}
+
+bool xe_guc_has_paging_engine(struct xe_guc *guc)
+{
+	struct xe_gt *gt = guc_to_gt(guc);
+	struct xe_device *xe = gt_to_xe(gt);
+
+	/*
+	 * On newer platforms the GuC now has a dedicated engine class for the
+	 * special PAGING engine, which is the driver reserved BCS engine used
+	 * for KMD paging/binding operations. GuC requires KMD to refer to this
+	 * using the special PAGING engine class. Note that there is no new hw
+	 * engine here, this is purely a sw view in the GuC itself, which we
+	 * need to respect.
+	 */
+
+	if (IS_SRIOV_VF(xe))
+		return xe_gt_sriov_vf_paging_engines(gt);
+
+	return xe->info.platform >= XE_NOVALAKE_S &&
+	       GUC_FIRMWARE_VER_AT_LEAST(guc, 70, 69, 0);
+}
+
+/**
+ * xe_hwe_guc_logical_instance - Get the GuC-aligned logical instance of a
+ * hardware engine.
+ * @hwe: Hardware engine.
+ *
+ * For GuC backend usage, we should no longer use the raw logical instance
+ * directly. This helper must be used to retrieve the logical instance of the
+ * hardware engine, taking care of any necessary adjustments (such as the GuC
+ * PAGING engine mapping). This is assumed to be used in conjunction with the
+ * GuC engine class.
+ *
+ * Return: Logical instance, taking into account for stuff like GuC PAGING
+ * engine mapping.
+ */
+u16 xe_hwe_guc_logical_instance(struct xe_hw_engine *hwe)
+{
+	struct xe_gt *gt = hwe->gt;
+
+	if (xe_guc_has_paging_engine(&hwe->gt->uc.guc) &&
+	    xe_gt_is_usm_hwe(gt, hwe)) {
+		int shift = gt->usm.paging_hwe0->logical_instance;
+
+		xe_gt_assert(gt, shift <= hwe->logical_instance);
+
+		/* GUC_PAGING_CLASS:guc_logical_instance */
+		return hwe->logical_instance - shift;
+	}
+
+	return hwe->logical_instance;
 }
 
 #if IS_ENABLED(CONFIG_DRM_XE_KUNIT_TEST)

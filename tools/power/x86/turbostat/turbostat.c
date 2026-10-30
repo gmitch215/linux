@@ -191,6 +191,7 @@ struct msr_counter bic[] = {
 	{ 0x0, "Any%C0", NULL, 0, 0, 0, NULL, 0 },
 	{ 0x0, "GFX%C0", NULL, 0, 0, 0, NULL, 0 },
 	{ 0x0, "CPUGFX%", NULL, 0, 0, 0, NULL, 0 },
+	{ 0x0, "Module", NULL, 0, 0, 0, NULL, 0 },
 	{ 0x0, "Core", NULL, 0, 0, 0, NULL, 0 },
 	{ 0x0, "CPU", NULL, 0, 0, 0, NULL, 0 },
 	{ 0x0, "APIC", NULL, 0, 0, 0, NULL, 0 },
@@ -264,6 +265,7 @@ enum bic_names {
 	BIC_Any_c0,
 	BIC_GFX_c0,
 	BIC_CPUGFX,
+	BIC_Module,
 	BIC_Core,
 	BIC_CPU,
 	BIC_APIC,
@@ -364,6 +366,7 @@ static void bic_groups_init(void)
 	SET_BIC(BIC_Node, &bic_group_topology);
 	SET_BIC(BIC_CoreCnt, &bic_group_topology);
 	SET_BIC(BIC_PkgCnt, &bic_group_topology);
+	SET_BIC(BIC_Module, &bic_group_topology);
 	SET_BIC(BIC_Core, &bic_group_topology);
 	SET_BIC(BIC_CPU, &bic_group_topology);
 	SET_BIC(BIC_Die, &bic_group_topology);
@@ -2031,8 +2034,11 @@ const struct dirent *pmt_diriter_begin(struct pmt_diriter_t *iter, const char *p
 			return NULL;
 
 		num_names = scandir(pmt_root_path, &iter->namelist, pmt_telemdir_filter, pmt_telemdir_sort);
-		if (num_names == -1)
+		if (num_names == -1) {
+			closedir(iter->dir);
+			iter->dir = NULL;
 			return NULL;
+		}
 	}
 
 	iter->current_name_idx = 0;
@@ -2060,8 +2066,10 @@ void pmt_diriter_remove(struct pmt_diriter_t *iter)
 	iter->num_names = 0;
 	iter->current_name_idx = 0;
 
-	closedir(iter->dir);
-	iter->dir = NULL;
+	if (iter->dir) {
+		closedir(iter->dir);
+		iter->dir = NULL;
+	}
 }
 
 unsigned int pmt_counter_get_width(const struct pmt_counter *p)
@@ -2383,6 +2391,7 @@ struct platform_counters {
 struct cpu_topology {
 	int cpu_id;
 	int core_id;		/* unique within a package */
+	int module_id;
 	int package_id;
 	int die_id;
 	int l3_id;
@@ -2404,6 +2413,8 @@ struct topo_params {
 	int allowed_cores;
 	int max_cpu_num;
 	int max_core_id;	/* within a package */
+	int min_module_id;	/* system wide */
+	int max_module_id;	/* system wide */
 	int max_package_id;
 	int max_die_id;
 	int max_l3_id;
@@ -2866,31 +2877,38 @@ void bic_lookup(cpu_set_t *ret_set, char *name_list, enum show_hide_mode mode)
 static inline int print_name(int width, int *printed, char *delim, char *name, enum counter_type type, enum counter_format format)
 {
 	UNUSED(type);
+	char *sep = (*printed)++ ? delim : "";
 
 	if (format == FORMAT_RAW && width >= 64)
-		return (sprintf(outp, "%s%-8s", ((*printed)++ ? delim : ""), name));
+		return sprintf(outp, "%s%-8s", sep, name);
 	else
-		return (sprintf(outp, "%s%s", ((*printed)++ ? delim : ""), name));
+		return sprintf(outp, "%s%s", sep, name);
 }
 
 static inline int print_hex_value(int width, int *printed, char *delim, unsigned long long value)
 {
+	char *sep = (*printed)++ ? delim : "";
+
 	if (width <= 32)
-		return (sprintf(outp, "%s%08x", ((*printed)++ ? delim : ""), (unsigned int)value));
+		return sprintf(outp, "%s%08llx", sep, value);
 	else
-		return (sprintf(outp, "%s%016llx", ((*printed)++ ? delim : ""), value));
+		return sprintf(outp, "%s%016llx", sep, value);
 }
 
 static inline int print_decimal_value(int width, int *printed, char *delim, unsigned long long value)
 {
+	char *sep = (*printed)++ ? delim : "";
+
 	UNUSED(width);
 
-	return (sprintf(outp, "%s%lld", ((*printed)++ ? delim : ""), value));
+	return sprintf(outp, "%s%lld", sep, value);
 }
 
 static inline int print_float_value(int *printed, char *delim, double value)
 {
-	return (sprintf(outp, "%s%0.2f", ((*printed)++ ? delim : ""), value));
+	char *sep = (*printed)++ ? delim : "";
+
+	return sprintf(outp, "%s%0.2f", sep, value);
 }
 
 void print_header(char *delim)
@@ -2912,6 +2930,8 @@ void print_header(char *delim)
 		outp += sprintf(outp, "%sL3", (printed++ ? delim : ""));
 	if (DO_BIC(BIC_Node))
 		outp += sprintf(outp, "%sNode", (printed++ ? delim : ""));
+	if (DO_BIC(BIC_Module))
+		outp += sprintf(outp, "%sModule", (printed++ ? delim : ""));
 	if (DO_BIC(BIC_Core))
 		outp += sprintf(outp, "%sCore", (printed++ ? delim : ""));
 	if (DO_BIC(BIC_CPU))
@@ -3207,7 +3227,7 @@ int dump_counters(PER_THREAD_PARAMS)
 	}
 
 	if (c && is_cpu_first_thread_in_core(t, c)) {
-		outp += sprintf(outp, "core: %d\n", cpus[t->cpu_id].core_id);
+		outp += sprintf(outp, "core: 0x%x\n", cpus[t->cpu_id].core_id);
 		outp += sprintf(outp, "c3: %016llX\n", c->c3);
 		outp += sprintf(outp, "c6: %016llX\n", c->c6);
 		outp += sprintf(outp, "c7: %016llX\n", c->c7);
@@ -3381,6 +3401,8 @@ int format_counters(PER_THREAD_PARAMS)
 			outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
 		if (DO_BIC(BIC_Node))
 			outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
+		if (DO_BIC(BIC_Module))
+			outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
 		if (DO_BIC(BIC_Core))
 			outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
 		if (DO_BIC(BIC_CPU))
@@ -3414,18 +3436,24 @@ int format_counters(PER_THREAD_PARAMS)
 			else
 				outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
 		}
+		if (DO_BIC(BIC_Module)) {
+			if (c)
+				outp += sprintf(outp, "%s0x%x", (printed++ ? delim : ""), cpus[t->cpu_id].module_id);
+			else
+				outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
+		}
 		if (DO_BIC(BIC_Core)) {
 			if (c)
-				outp += sprintf(outp, "%s%d", (printed++ ? delim : ""), cpus[t->cpu_id].core_id);
+				outp += sprintf(outp, "%s0x%x", (printed++ ? delim : ""), cpus[t->cpu_id].core_id);
 			else
 				outp += sprintf(outp, "%s-", (printed++ ? delim : ""));
 		}
 		if (DO_BIC(BIC_CPU))
 			outp += sprintf(outp, "%s%d", (printed++ ? delim : ""), t->cpu_id);
 		if (DO_BIC(BIC_APIC))
-			outp += sprintf(outp, "%s%d", (printed++ ? delim : ""), t->apic_id);
+			outp += sprintf(outp, "%s0x%x", (printed++ ? delim : ""), t->apic_id);
 		if (DO_BIC(BIC_X2APIC))
-			outp += sprintf(outp, "%s%d", (printed++ ? delim : ""), t->x2apic_id);
+			outp += sprintf(outp, "%s0x%x", (printed++ ? delim : ""), t->x2apic_id);
 	}
 
 	if (DO_BIC(BIC_Avg_MHz))
@@ -3613,7 +3641,7 @@ int format_counters(PER_THREAD_PARAMS)
 		if (p->gfx_rc6_ms == -1) {	/* detect GFX counter reset */
 			outp += sprintf(outp, "%s**.**", (printed++ ? delim : ""));
 		} else {
-			outp += sprintf(outp, "%s%.2f", (printed++ ? delim : ""), p->gfx_rc6_ms / 10.0 / interval_float);
+			outp += sprintf(outp, "%s%.2f", (printed++ ? delim : ""), pct(p->gfx_rc6_ms / 10.0, interval_float));
 		}
 	}
 
@@ -3630,7 +3658,7 @@ int format_counters(PER_THREAD_PARAMS)
 		if (p->sam_mc6_ms == -1) {	/* detect GFX counter reset */
 			outp += sprintf(outp, "%s**.**", (printed++ ? delim : ""));
 		} else {
-			outp += sprintf(outp, "%s%.2f", (printed++ ? delim : ""), p->sam_mc6_ms / 10.0 / interval_float);
+			outp += sprintf(outp, "%s%.2f", (printed++ ? delim : ""), pct(p->sam_mc6_ms / 10.0, interval_float));
 		}
 	}
 
@@ -5892,7 +5920,7 @@ void free_fd_msr(void)
 	if (!msr_counter_info)
 		return;
 
-	for (int cpu = 0; cpu < topo.max_cpu_num; ++cpu) {
+	for (int cpu = 0; cpu <= topo.max_cpu_num; ++cpu) {
 		if (msr_counter_info[cpu].fd_perf != -1)
 			close(msr_counter_info[cpu].fd_perf);
 	}
@@ -6072,6 +6100,11 @@ int get_l3_id(int cpu)
 	return parse_int_file("/sys/devices/system/cpu/cpu%d/cache/index3/id", cpu);
 }
 
+int get_module_id(int cpu)
+{
+	return parse_int_file("/sys/devices/system/cpu/cpu%d/topology/cluster_id", cpu);
+}
+
 int get_core_id(int cpu)
 {
 	return parse_int_file("/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
@@ -6191,55 +6224,6 @@ static int parse_cpu_str(char *cpu_str, cpu_set_t *cpu_set, int cpu_set_size)
 	return 0;
 }
 
-int set_thread_siblings(struct cpu_topology *thiscpu)
-{
-	char path[80], character;
-	FILE *filep;
-	unsigned long map;
-	int so, shift, sib_core;
-	int cpu = thiscpu->cpu_id;
-	int offset = topo.max_cpu_num + 1;
-	size_t size;
-	int ht_id = 0;
-
-	thiscpu->put_ids = CPU_ALLOC((topo.max_cpu_num + 1));
-	if (thiscpu->ht_id < 0)
-		thiscpu->ht_id = 0;	/* first CPU in core */
-	if (!thiscpu->put_ids)
-		return -1;
-
-	size = CPU_ALLOC_SIZE((topo.max_cpu_num + 1));
-	CPU_ZERO_S(size, thiscpu->put_ids);
-
-	sprintf(path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings", cpu);
-	filep = fopen(path, "r");
-
-	if (!filep) {
-		warnx("%s: open failed", path);
-		return -1;
-	}
-	do {
-		offset -= BITMASK_SIZE;
-		if (fscanf(filep, "%lx%c", &map, &character) != 2)
-			err(1, "%s: failed to parse file", path);
-		for (shift = 0; shift < BITMASK_SIZE; shift++) {
-			if ((map >> shift) & 0x1) {
-				so = shift + offset;
-				sib_core = get_core_id(so);
-				if (sib_core == thiscpu->core_id) {
-					CPU_SET_S(so, size, thiscpu->put_ids);
-					cpus[so].ht_id = ht_id;
-					cpus[cpu].ht_sibling_cpu_id[ht_id] = so;
-					ht_id += 1;
-				}
-			}
-		}
-	} while (character == ',');
-	fclose(filep);
-
-	return CPU_COUNT_S(size, thiscpu->put_ids);
-}
-
 /*
  * run func(thread, core, package) in topology order
  * skip non-present cpus
@@ -6332,33 +6316,35 @@ int for_all_proc_cpus(int (func) (int))
 
 #define PATH_EFFECTIVE_CPUS	"/sys/fs/cgroup/cpuset.cpus.effective"
 
-static char cpu_effective_str[1024];
+static char *cpu_effective_str;
 
 static int update_effective_str(bool startup)
 {
 	FILE *fp;
-	char *pos;
-	char buf[1024];
+	char *buf = NULL;
+	size_t size = 0;
 	int ret;
 
-	if (cpu_effective_str[0] == '\0' && !startup)
+	if (!cpu_effective_str && !startup)
 		return 0;
 
 	fp = fopen(PATH_EFFECTIVE_CPUS, "r");
 	if (!fp)
 		return 0;
 
-	pos = fgets(buf, 1024, fp);
-	if (!pos)
+	if (getline(&buf, &size, fp) < 0)
 		err(1, "%s: file read failed", PATH_EFFECTIVE_CPUS);
 
 	fclose(fp);
 
-	ret = strncmp(cpu_effective_str, buf, 1024);
-	if (!ret)
+	ret = cpu_effective_str ? strcmp(cpu_effective_str, buf) : 1;
+	if (!ret) {
+		free(buf);
 		return 0;
+	}
 
-	strncpy(cpu_effective_str, buf, 1024);
+	free(cpu_effective_str);
+	cpu_effective_str = buf;
 	return 1;
 }
 
@@ -8550,13 +8536,16 @@ end:
 	return ret;
 }
 
-char cpuset_buf[1024];
-int initialize_cpu_set_from_sysfs(cpu_set_t *cpu_set, char *sysfs_path, char *sysfs_file)
+int initialize_cpu_set_from_sysfs(cpu_set_t *cpu_set, const char *sysfs_path,
+				  const char *sysfs_file)
 {
 	FILE *fp;
+	char *cpuset_buf = NULL;
+	size_t size = 0;
 	char path[128];
+	int ret = -1;
 
-	if (snprintf(path, 128, "%s/%s", sysfs_path, sysfs_file) > 128)
+	if (snprintf(path, sizeof(path), "%s/%s", sysfs_path, sysfs_file) >= (int)sizeof(path))
 		err(-1, "%s %s", sysfs_path, sysfs_file);
 
 	fp = fopen(path, "r");
@@ -8564,19 +8553,20 @@ int initialize_cpu_set_from_sysfs(cpu_set_t *cpu_set, char *sysfs_path, char *sy
 		warn("open %s", path);
 		return -1;
 	}
-	if (fread(cpuset_buf, sizeof(char), 1024, fp) == 0) {
+	if (getline(&cpuset_buf, &size, fp) < 0) {
 		warn("read %s", sysfs_path);
-		goto err;
+		goto out;
 	}
 	if (parse_cpu_str(cpuset_buf, cpu_set, cpu_possible_setsize)) {
-		warnx("%s: cpu str malformat %s\n", sysfs_path, cpu_effective_str);
-		goto err;
+		warnx("%s: cpu str malformat %s\n", sysfs_path, cpuset_buf);
+		goto out;
 	}
-	return 0;
+	ret = 0;
 
-err:
+out:
 	fclose(fp);
-	return -1;
+	free(cpuset_buf);
+	return ret;
 }
 
 void print_cpu_set(char *s, cpu_set_t *set)
@@ -8676,6 +8666,8 @@ void rapl_perf_init(void)
 {
 	const unsigned int num_domains = get_rapl_num_domains();
 	bool *domain_visited = calloc(num_domains, sizeof(bool));
+	if (!domain_visited)
+		err(-1, "calloc domain_visited");
 
 	rapl_counter_info_perdomain = calloc(num_domains, sizeof(*rapl_counter_info_perdomain));
 	if (rapl_counter_info_perdomain == NULL)
@@ -9492,8 +9484,10 @@ void perf_l2_init(void)
 				free_fd_l2_percpu();
 				return;
 			}
-		} else
-			err(-1, "%s: cpu%d: type %d", __func__, cpu, cpus[cpu].type);
+		} else {
+			warn("%s: cpu%d: type %d: Update kernel perf support or use \"--hide L2MRPS,L2%%hit\" or \"--hide cache\" or \"--no-perf\"", __func__, cpu, cpus[cpu].type);
+			return;
+		}
 	}
 	BIC_PRESENT(BIC_L2_MRPS);
 	BIC_PRESENT(BIC_L2_HIT);
@@ -9509,6 +9503,37 @@ int dir_filter(const struct dirent *dirp)
 		return 1;
 	else
 		return 0;
+}
+
+int set_thread_siblings(struct cpu_topology *thiscpu)
+{
+	char path[80];
+	int cpu = thiscpu->cpu_id;
+	size_t size;
+	int ht_id = 0;
+	int i;
+
+	thiscpu->put_ids = CPU_ALLOC((topo.max_cpu_num + 1));
+	if (thiscpu->ht_id < 0)
+		thiscpu->ht_id = 0;	/* first CPU in core */
+	if (!thiscpu->put_ids)
+		return -1;
+
+	size = CPU_ALLOC_SIZE((topo.max_cpu_num + 1));
+	CPU_ZERO_S(size, thiscpu->put_ids);
+
+	sprintf(path, "/sys/devices/system/cpu/cpu%d/topology", cpu);
+
+	initialize_cpu_set_from_sysfs(thiscpu->put_ids, path, "thread_siblings_list");
+
+	for (i = 0; i <= topo.max_cpu_num; ++i)
+		if (CPU_ISSET_S(i, size, thiscpu->put_ids)) {
+			cpus[i].ht_id = ht_id;
+			cpus[cpu].ht_sibling_cpu_id[ht_id] = i;
+			ht_id += 1;
+		}
+
+	return (ht_id - 1);
 }
 
 void topology_probe(bool startup)
@@ -9634,6 +9659,7 @@ void topology_probe(bool startup)
 	 * For online cpus
 	 * find max_core_id, max_package_id, num_cores (per system)
 	 */
+	topo.min_module_id = 0x7FFFFFFF;
 	for (i = 0; i <= topo.max_cpu_num; ++i) {
 		int siblings;
 
@@ -9665,6 +9691,13 @@ void topology_probe(bool startup)
 		if (cpus[i].physical_node_id > topo.max_node_num)
 			topo.max_node_num = cpus[i].physical_node_id;
 
+		/* get module information */
+		cpus[i].module_id = get_module_id(i);
+		if (cpus[i].module_id > topo.max_module_id)
+			topo.max_module_id = cpus[i].module_id;
+		if (cpus[i].module_id < topo.min_module_id)
+			topo.min_module_id = cpus[i].module_id;
+
 		/* get core information */
 		cpus[i].core_id = get_core_id(i);
 		if (cpus[i].core_id > max_core_id)
@@ -9685,6 +9718,11 @@ void topology_probe(bool startup)
 		fprintf(outf, "max_core_id %d, sizing for %d cores per package\n", max_core_id, topo.cores_per_pkg);
 	if (!summary_only)
 		BIC_PRESENT(BIC_Core);
+
+	if (debug > 1)
+		fprintf(outf, "min_module_id %d max_module_id %d\n", topo.min_module_id, topo.max_module_id);
+	if (!summary_only && (topo.min_module_id != topo.max_module_id))
+		BIC_PRESENT(BIC_Module);
 
 	topo.num_die = topo.max_die_id + 1;
 	if (debug > 1)
@@ -9720,9 +9758,9 @@ void topology_probe(bool startup)
 		if (cpu_is_not_present(i))
 			continue;
 		fprintf(outf,
-			"cpu %d pkg %d die %d l3 %d node %d lnode %d core %d ht_id %d",
+			"cpu %d pkg %d die %d l3 %d node %d lnode %d module 0x%x core %d ht_id %d",
 			i, cpus[i].package_id, cpus[i].die_id, cpus[i].l3_id,
-			cpus[i].physical_node_id, cpus[i].logical_node_id, cpus[i].core_id, cpus[i].ht_id);
+			cpus[i].physical_node_id, cpus[i].logical_node_id, cpus[i].module_id, cpus[i].core_id, cpus[i].ht_id);
 		fprintf(outf, " siblings");
 		for (ht_id = 0; ht_id <= MAX_HT_ID; ++ht_id)
 			fprintf(outf, " %d", cpus[i].ht_sibling_cpu_id[ht_id]);
@@ -9976,6 +10014,8 @@ int added_perf_counters_init_(struct perf_counter_info *pinfo)
 	const size_t max_num_domains = MAX(topo.max_cpu_num + 1, MAX(topo.max_core_id + 1, topo.max_package_id + 1));
 
 	domain_visited = calloc(max_num_domains, sizeof(*domain_visited));
+	if (!domain_visited)
+		errx(1, "%s: alloc %s", __func__, "domain_visited");
 
 	while (pinfo) {
 		switch (pinfo->scope) {
@@ -10367,6 +10407,8 @@ int pmt_add_counter(unsigned int guid, unsigned int seq, const char *name, enum 
 	pcounter = pmt_find_counter(*pmt_root, name);
 	if (!pcounter) {
 		pcounter = calloc(1, sizeof(*pcounter));
+		if (!pcounter)
+			return 1;
 		new_counter = true;
 	}
 
@@ -10416,7 +10458,7 @@ void pmt_init(void)
 		mod_num = 0;	/* Relative module number for current PMT file. */
 
 		/* Open the counter for each CPU. */
-		for (cpu_num = 0; cpu_num < topo.max_cpu_num;) {
+		for (cpu_num = 0; cpu_num <= topo.max_cpu_num;) {
 
 			if (cpu_is_not_allowed(cpu_num))
 				goto next_loop_iter;
@@ -10585,7 +10627,7 @@ int get_and_dump_counters(void)
 
 void print_version()
 {
-	fprintf(outf, "turbostat version 2026.02.14 - Len Brown <lenb@kernel.org>\n");
+	fprintf(outf, "turbostat version 2026.09.28 - Len Brown <lenb@kernel.org>\n");
 }
 
 #define COMMAND_LINE_SIZE 2048
@@ -10645,10 +10687,11 @@ int add_counter(unsigned int msr_num, char *path, char *name,
 				fprintf(stderr, "%s: %s FOUND\n", __func__, name);
 			break;
 		}
-		if (sys.added_thread_counters++ >= MAX_ADDED_THREAD_COUNTERS) {
+		if (sys.added_thread_counters >= MAX_ADDED_THREAD_COUNTERS) {
 			warnx("ignoring thread counter %s", name);
 			return -1;
 		}
+		sys.added_thread_counters++;
 		break;
 	case SCOPE_CORE:
 		msrp = find_msrp_by_name(sys.cp, name);
@@ -10657,10 +10700,11 @@ int add_counter(unsigned int msr_num, char *path, char *name,
 				fprintf(stderr, "%s: %s FOUND\n", __func__, name);
 			break;
 		}
-		if (sys.added_core_counters++ >= MAX_ADDED_CORE_COUNTERS) {
+		if (sys.added_core_counters >= MAX_ADDED_CORE_COUNTERS) {
 			warnx("ignoring core counter %s", name);
 			return -1;
 		}
+		sys.added_core_counters++;
 		break;
 	case SCOPE_PACKAGE:
 		msrp = find_msrp_by_name(sys.pp, name);
@@ -10669,10 +10713,11 @@ int add_counter(unsigned int msr_num, char *path, char *name,
 				fprintf(stderr, "%s: %s FOUND\n", __func__, name);
 			break;
 		}
-		if (sys.added_package_counters++ >= MAX_ADDED_PACKAGE_COUNTERS) {
+		if (sys.added_package_counters >= MAX_ADDED_PACKAGE_COUNTERS) {
 			warnx("ignoring package counter %s", name);
 			return -1;
 		}
+		sys.added_package_counters++;
 		break;
 	default:
 		warnx("ignoring counter %s with unknown scope", name);

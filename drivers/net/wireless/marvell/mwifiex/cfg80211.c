@@ -141,11 +141,11 @@ static void *mwifiex_cfg80211_get_adapter(struct wiphy *wiphy)
  * CFG802.11 operation handler to delete a network key.
  */
 static int
-mwifiex_cfg80211_del_key(struct wiphy *wiphy, struct net_device *netdev,
+mwifiex_cfg80211_del_key(struct wiphy *wiphy, struct wireless_dev *wdev,
 			 int link_id, u8 key_index, bool pairwise,
 			 const u8 *mac_addr)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(netdev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 	static const u8 bc_mac[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 	const u8 *peer_mac = pairwise ? mac_addr : bc_mac;
 
@@ -196,7 +196,7 @@ mwifiex_form_mgmt_frame(struct sk_buff *skb, const u8 *buf, size_t len)
  */
 static int
 mwifiex_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
-			 struct cfg80211_mgmt_tx_params *params, u64 *cookie)
+			 struct cfg80211_mgmt_tx_params *params, u64 cookie)
 {
 	const u8 *buf = params->buf;
 	size_t len = params->len;
@@ -259,14 +259,13 @@ mwifiex_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 	tx_info->pkt_len = pkt_len;
 
 	mwifiex_form_mgmt_frame(skb, buf, len);
-	*cookie = get_random_u32() | 1;
 
 	if (ieee80211_is_action(mgmt->frame_control))
 		skb = mwifiex_clone_skb_for_tx_status(priv,
 						      skb,
-				MWIFIEX_BUF_FLAG_ACTION_TX_STATUS, cookie);
+				MWIFIEX_BUF_FLAG_ACTION_TX_STATUS, &cookie);
 	else
-		cfg80211_mgmt_tx_status(wdev, *cookie, buf, len, true,
+		cfg80211_mgmt_tx_status(wdev, cookie, buf, len, true,
 					GFP_ATOMIC);
 
 	mwifiex_queue_tx_pkt(priv, skb);
@@ -304,12 +303,13 @@ static int
 mwifiex_cfg80211_remain_on_channel(struct wiphy *wiphy,
 				   struct wireless_dev *wdev,
 				   struct ieee80211_channel *chan,
-				   unsigned int duration, u64 *cookie)
+				   unsigned int duration, u64 cookie,
+				   const u8 *rx_addr)
 {
 	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 	int ret;
 
-	if (!chan || !cookie) {
+	if (!chan) {
 		mwifiex_dbg(priv->adapter, ERROR, "Invalid parameter for ROC\n");
 		return -EINVAL;
 	}
@@ -325,15 +325,14 @@ mwifiex_cfg80211_remain_on_channel(struct wiphy *wiphy,
 					 duration);
 
 	if (!ret) {
-		*cookie = get_random_u32() | 1;
-		priv->roc_cfg.cookie = *cookie;
+		priv->roc_cfg.cookie = cookie;
 		priv->roc_cfg.chan = *chan;
 
-		cfg80211_ready_on_channel(wdev, *cookie, chan,
+		cfg80211_ready_on_channel(wdev, cookie, chan,
 					  duration, GFP_ATOMIC);
 
 		mwifiex_dbg(priv->adapter, INFO,
-			    "info: ROC, cookie = 0x%llx\n", *cookie);
+			    "info: ROC, cookie = 0x%llx\n", cookie);
 	}
 
 	return ret;
@@ -480,11 +479,11 @@ mwifiex_cfg80211_set_default_key(struct wiphy *wiphy, struct net_device *netdev,
  * CFG802.11 operation handler to add a network key.
  */
 static int
-mwifiex_cfg80211_add_key(struct wiphy *wiphy, struct net_device *netdev,
+mwifiex_cfg80211_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
 			 int link_id, u8 key_index, bool pairwise,
 			 const u8 *mac_addr, struct key_params *params)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(netdev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 	struct mwifiex_wep_key *wep_key;
 	static const u8 bc_mac[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 	const u8 *peer_mac = pairwise ? mac_addr : bc_mac;
@@ -518,11 +517,11 @@ mwifiex_cfg80211_add_key(struct wiphy *wiphy, struct net_device *netdev,
  */
 static int
 mwifiex_cfg80211_set_default_mgmt_key(struct wiphy *wiphy,
-				      struct net_device *netdev,
+				      struct wireless_dev *wdev,
 				      int link_id,
 				      u8 key_index)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(netdev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 	struct mwifiex_ds_encrypt_key encrypt_key;
 
 	wiphy_dbg(wiphy, "set default mgmt key, key index=%d\n", key_index);
@@ -1554,10 +1553,10 @@ mwifiex_dump_station_info(struct mwifiex_private *priv,
  * requested station information, if available.
  */
 static int
-mwifiex_cfg80211_get_station(struct wiphy *wiphy, struct net_device *dev,
+mwifiex_cfg80211_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 			     const u8 *mac, struct station_info *sinfo)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(dev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 
 	if (!priv->media_connected)
 		return -ENOENT;
@@ -1571,10 +1570,10 @@ mwifiex_cfg80211_get_station(struct wiphy *wiphy, struct net_device *dev,
  * CFG802.11 operation handler to dump station information.
  */
 static int
-mwifiex_cfg80211_dump_station(struct wiphy *wiphy, struct net_device *dev,
+mwifiex_cfg80211_dump_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 			      int idx, u8 *mac, struct station_info *sinfo)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(dev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 	struct mwifiex_sta_node *node;
 	int i;
 
@@ -1901,10 +1900,11 @@ static int mwifiex_cfg80211_change_beacon(struct wiphy *wiphy,
  * associated stations list, no action is taken.
  */
 static int
-mwifiex_cfg80211_del_station(struct wiphy *wiphy, struct net_device *dev,
+mwifiex_cfg80211_del_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 			     struct station_del_parameters *params)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(dev);
+	struct mwifiex_private *priv =
+		mwifiex_netdev_get_priv(wdev->netdev);
 	struct mwifiex_sta_node *sta_node;
 	u8 deauth_mac[ETH_ALEN];
 
@@ -3993,7 +3993,8 @@ mwifiex_cfg80211_uap_add_station(struct mwifiex_private *priv, const u8 *mac,
 		if (!sinfo)
 			return -ENOMEM;
 
-		cfg80211_new_sta(priv->netdev, mac, sinfo, GFP_KERNEL);
+		cfg80211_new_sta(priv->netdev->ieee80211_ptr, mac, sinfo,
+				 GFP_KERNEL);
 		kfree(sinfo);
 	}
 
@@ -4001,10 +4002,10 @@ mwifiex_cfg80211_uap_add_station(struct mwifiex_private *priv, const u8 *mac,
 }
 
 static int
-mwifiex_cfg80211_add_station(struct wiphy *wiphy, struct net_device *dev,
+mwifiex_cfg80211_add_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 			     const u8 *mac, struct station_parameters *params)
 {
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(dev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 
 	if (priv->adapter->host_mlme_enabled &&
 	    (GET_BSS_ROLE(priv) == MWIFIEX_BSS_ROLE_UAP))
@@ -4240,12 +4241,12 @@ mwifiex_cfg80211_start_radar_detection(struct wiphy *wiphy,
 }
 
 static int
-mwifiex_cfg80211_change_station(struct wiphy *wiphy, struct net_device *dev,
+mwifiex_cfg80211_change_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 				const u8 *mac,
 				struct station_parameters *params)
 {
 	int ret;
-	struct mwifiex_private *priv = mwifiex_netdev_get_priv(dev);
+	struct mwifiex_private *priv = mwifiex_netdev_get_priv(wdev->netdev);
 
 	if (priv->adapter->host_mlme_enabled &&
 	    (GET_BSS_ROLE(priv) == MWIFIEX_BSS_ROLE_UAP))
@@ -4276,6 +4277,7 @@ mwifiex_cfg80211_authenticate(struct wiphy *wiphy,
 	struct mwifiex_adapter *adapter = priv->adapter;
 	struct sk_buff *skb;
 	u16 pkt_len, auth_alg;
+	size_t frame_len;
 	int ret;
 	struct mwifiex_ieee80211_mgmt *mgmt;
 	struct mwifiex_txinfo *tx_info;
@@ -4331,7 +4333,7 @@ mwifiex_cfg80211_authenticate(struct wiphy *wiphy,
 		return -EOPNOTSUPP;
 	}
 
-	if (!priv->auth_flag) {
+	if (!(priv->auth_flag & HOST_MLME_AUTH_PENDING)) {
 		ret = mwifiex_remain_on_chan_cfg(priv, HostCmd_ACT_GEN_SET,
 						 req->bss->channel,
 						 AUTH_TX_DEFAULT_WAIT_TIME);
@@ -4348,10 +4350,17 @@ mwifiex_cfg80211_authenticate(struct wiphy *wiphy,
 
 	mwifiex_cancel_scan(adapter);
 
-	pkt_len = (u16)req->ie_len + req->auth_data_len +
+	frame_len = req->ie_len + req->auth_data_len +
 		MWIFIEX_MGMT_HEADER_LEN + MWIFIEX_AUTH_BODY_LEN;
 	if (req->auth_data_len >= 4)
-		pkt_len -= 4;
+		frame_len -= 4;
+
+	if (frame_len > U16_MAX) {
+		mwifiex_dbg(priv->adapter, ERROR,
+			    "auth frame too long: %zu bytes\n", frame_len);
+		return -EINVAL;
+	}
+	pkt_len = frame_len;
 
 	skb = dev_alloc_skb(MWIFIEX_MIN_DATA_HEADER_LEN +
 			    MWIFIEX_MGMT_FRAME_HEADER_SIZE +
@@ -4555,9 +4564,9 @@ mwifiex_cfg80211_disassociate(struct wiphy *wiphy,
 }
 
 static int
-mwifiex_cfg80211_probe_client(struct wiphy *wiphy,
-			      struct net_device *dev, const u8 *peer,
-			      u64 *cookie)
+mwifiex_cfg80211_probe_peer(struct wiphy *wiphy,
+			    struct net_device *dev, const u8 *peer,
+			    u64 cookie)
 {
 	/* hostapd looks for NL80211_CMD_PROBE_CLIENT support; otherwise,
 	 * it requires monitor-mode support (which mwifiex doesn't support).
@@ -4723,7 +4732,7 @@ int mwifiex_register_cfg80211(struct mwifiex_adapter *adapter)
 		ops->disassoc = mwifiex_cfg80211_disassociate;
 		ops->disconnect = NULL;
 		ops->connect = NULL;
-		ops->probe_client = mwifiex_cfg80211_probe_client;
+		ops->probe_peer = mwifiex_cfg80211_probe_peer;
 	}
 	wiphy->max_scan_ssids = MWIFIEX_MAX_SSID_LIST_LENGTH;
 	wiphy->max_scan_ie_len = MWIFIEX_MAX_VSIE_LEN;

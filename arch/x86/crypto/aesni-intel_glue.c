@@ -25,6 +25,7 @@
 #include <crypto/aes.h>
 #include <crypto/b128ops.h>
 #include <crypto/gcm.h>
+#include <crypto/gf128mul.h>
 #include <crypto/xts.h>
 #include <asm/cpu_device_id.h>
 #include <asm/simd.h>
@@ -1292,6 +1293,7 @@ static void gcm_process_assoc(const struct aes_gcm_key *key, u8 ghash_acc[16],
 		unsigned int len;
 		const u8 *src = walk.addr;
 
+		assoclen -= orig_len_this_step;
 		if (unlikely(pos)) {
 			len = min(len_this_step, 16 - pos);
 			memcpy(&buf[pos], src, len);
@@ -1319,7 +1321,6 @@ next:
 			kernel_fpu_end();
 			kernel_fpu_begin();
 		}
-		assoclen -= orig_len_this_step;
 	}
 	if (unlikely(pos))
 		aes_gcm_aad_update(key, ghash_acc, buf, pos, flags);

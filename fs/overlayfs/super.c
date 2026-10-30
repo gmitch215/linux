@@ -451,18 +451,13 @@ static int ovl_lower_dir(const char *name, const struct path *path,
 	return 0;
 }
 
-/* Workdir should not be subdir of upperdir and vice versa */
+/*
+ * Workdir should not be subdir of upperdir and vice versa, and
+ * they should not be the same.
+ */
 static bool ovl_workdir_ok(struct dentry *workdir, struct dentry *upperdir)
 {
-	bool ok = false;
-
-	if (workdir != upperdir) {
-		struct dentry *trap = lock_rename(workdir, upperdir);
-		if (!IS_ERR(trap))
-			unlock_rename(workdir, upperdir);
-		ok = (trap == NULL);
-	}
-	return ok;
+	return !is_subdir(workdir, upperdir) && !is_subdir(upperdir, workdir);
 }
 
 static int ovl_setup_trap(struct super_block *sb, struct dentry *dir,
@@ -634,6 +629,7 @@ static struct dentry *ovl_lookup_or_create(struct ovl_fs *ofs,
 	if (!IS_ERR(child)) {
 		if (!child->d_inode)
 			child = ovl_create_real(ofs, parent, child,
+						&QSTR(name),
 						OVL_CATTR(mode));
 		end_creating_keep(child);
 	}
@@ -1547,8 +1543,9 @@ int ovl_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct ovl_fs *ofs = sb->s_fs_info;
 	int err;
 
-	err = -EIO;
-	if (WARN_ON(fc->user_ns != current_user_ns()))
+	err = -EINVAL;
+	/* The fscontext fd may have been passed to another user namespace. */
+	if (fc->user_ns != current_user_ns())
 		goto out_err;
 
 	ovl_set_d_op(sb);
@@ -1577,7 +1574,7 @@ struct file_system_type ovl_fs_type = {
 	.name			= "overlay",
 	.init_fs_context	= ovl_init_fs_context,
 	.parameters		= ovl_parameter_spec,
-	.fs_flags		= FS_USERNS_MOUNT,
+	.fs_flags		= FS_USERNS_MOUNT | FS_ALLOW_IDMAP,
 	.kill_sb		= kill_anon_super,
 };
 MODULE_ALIAS_FS("overlay");

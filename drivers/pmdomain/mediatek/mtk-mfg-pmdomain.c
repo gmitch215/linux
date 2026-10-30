@@ -10,6 +10,7 @@
 #include <linux/clk-provider.h>
 #include <linux/container_of.h>
 #include <linux/iopoll.h>
+#include <linux/nvmem-provider.h>
 #include <linux/mailbox_client.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -235,14 +236,14 @@ struct __packed mtk_mfg_ipi_sleep_msg {
  *
  * This struct is part of the ABI with the EB firmware. Do not change it.
  */
-struct __packed mtk_mfg_opp_entry {
+struct mtk_mfg_opp_entry {
 	__le32 freq_khz;
 	__le32 voltage_core;
 	__le32 voltage_sram;
 	__le32 posdiv;
 	__le32 voltage_margin;
 	__le32 power_mw;
-};
+} __packed;
 
 struct mtk_mfg_mbox {
 	struct mbox_client cl;
@@ -309,25 +310,6 @@ static unsigned long mtk_mfg_recalc_rate_gpu(struct clk_hw *hw,
 	return readl(mfg->shared_mem + GF_REG_FREQ_OUT_GPU) * HZ_PER_KHZ;
 }
 
-static int mtk_mfg_determine_rate(struct clk_hw *hw,
-				  struct clk_rate_request *req)
-{
-	/*
-	 * The determine_rate callback needs to be implemented to avoid returning
-	 * the current clock frequency, rather than something even remotely
-	 * close to the frequency that was asked for.
-	 *
-	 * Instead of writing considerable amounts of possibly slow code just to
-	 * somehow figure out which of the three PLLs to round for, or even to
-	 * do a search through one of two OPP tables in order to find the closest
-	 * OPP of a frequency, just return the rate as-is. This avoids devfreq
-	 * "rounding" a request for the lowest frequency to the possibly very
-	 * high current frequency, breaking the powersave governor in the process.
-	 */
-
-	return 0;
-}
-
 static unsigned long mtk_mfg_recalc_rate_stack(struct clk_hw *hw,
 					       unsigned long parent_rate)
 {
@@ -338,12 +320,12 @@ static unsigned long mtk_mfg_recalc_rate_stack(struct clk_hw *hw,
 
 static const struct clk_ops mtk_mfg_clk_gpu_ops = {
 	.recalc_rate = mtk_mfg_recalc_rate_gpu,
-	.determine_rate = mtk_mfg_determine_rate,
+	.determine_rate = clk_determine_rate_noop,
 };
 
 static const struct clk_ops mtk_mfg_clk_stack_ops = {
 	.recalc_rate = mtk_mfg_recalc_rate_stack,
-	.determine_rate = mtk_mfg_determine_rate,
+	.determine_rate = clk_determine_rate_noop,
 };
 
 static const struct clk_init_data mtk_mfg_clk_gpu_init = {
@@ -656,7 +638,7 @@ static int mtk_mfg_attach_dev(struct generic_pm_domain *pd, struct device *dev)
 	struct mtk_mfg *mfg = mtk_mfg_from_genpd(pd);
 	struct dev_pm_opp_data *so = mfg->stack_opps;
 	struct dev_pm_opp_data *go = mfg->gpu_opps;
-	struct dev_pm_opp_data *prev_o;
+	struct dev_pm_opp_data *prev_o = NULL;
 	struct dev_pm_opp_data *o;
 	int i, ret;
 
@@ -872,6 +854,60 @@ static int mtk_mfg_init_clk_provider(struct mtk_mfg *mfg)
 	return 0;
 }
 
+static int mtk_mfg_read_nvmem(void *priv, unsigned int offset, void *val, size_t bytes)
+{
+	struct mtk_mfg *mfg = priv;
+	u32 *buf = val;
+
+	if (bytes != 4)
+		return -EINVAL;
+
+	if (!mfg->shared_mem)
+		return -ENODEV;
+
+	if (offset + bytes >= mfg->shared_mem_size)
+		return -EINVAL;
+
+	*buf = readl(mfg->shared_mem + offset);
+
+	return 0;
+}
+
+static int mtk_mfg_init_nvmem_provider(struct mtk_mfg *mfg)
+{
+	struct device *dev = &mfg->pdev->dev;
+	struct nvmem_cell_info cell = {};
+	struct nvmem_config config = {};
+	struct nvmem_device *nvdev;
+	int ret;
+
+	config.reg_read = mtk_mfg_read_nvmem;
+	config.dev = dev;
+	config.read_only = true;
+	config.priv = mfg;
+	config.size = 4;
+	config.word_size = 4;
+
+	nvdev = devm_nvmem_register(dev, &config);
+	if (IS_ERR(nvdev))
+		return dev_err_probe(dev, PTR_ERR(nvdev), "Couldn't register nvmem provider\n");
+
+	cell.name = "shader-present";
+	cell.offset = GF_REG_SHADER_PRESENT;
+	cell.bytes = 4;
+	cell.np = of_get_child_by_name(dev->of_node, cell.name);
+
+	ret = nvmem_add_one_cell(nvdev, &cell);
+	if (ret) {
+		of_node_put(cell.np);
+		return dev_err_probe(dev, ret, "Couldn't add cell %s\n", cell.name);
+	}
+
+	/* cell.np purposefully not put as nvmem_add_one_cell does not increase refcount */
+
+	return 0;
+}
+
 static int mtk_mfg_probe(struct platform_device *pdev)
 {
 	struct mtk_mfg *mfg;
@@ -981,6 +1017,10 @@ static int mtk_mfg_probe(struct platform_device *pdev)
 	}
 
 	ret = mtk_mfg_init_clk_provider(mfg);
+	if (ret)
+		goto err_power_off;
+
+	ret = mtk_mfg_init_nvmem_provider(mfg);
 	if (ret)
 		goto err_power_off;
 

@@ -366,6 +366,31 @@ struct otx2_flow_config {
 	u16			ntuple_cnt;
 };
 
+struct otx2_tc_flow_stats {
+	u64 bytes;
+	u64 pkts;
+	u64 used;
+};
+
+struct otx2_tc_flow {
+	struct list_head		list;
+	unsigned long			cookie;
+	struct rcu_head			rcu;
+	struct otx2_tc_flow_stats	stats;
+	spinlock_t			lock; /* lock for stats */
+	u16				rq;
+	u16				entry;
+	u16				leaf_profile;
+	bool				is_act_police;
+	u32				prio;
+	struct npc_install_flow_req	req;
+	u64				rate;
+	u32				burst;
+	u32				mcast_grp_idx;
+	bool				is_pps;
+	u8				kw_type; /* X2/X4 */
+};
+
 struct dev_hw_ops {
 	int	(*sq_aq_init)(void *dev, u16 qidx, u8 chan_offset,
 			      u16 sqb_aura);
@@ -1004,6 +1029,15 @@ static inline int otx2_tc_flower_rule_cnt(struct otx2_nic *pfvf)
 	return pfvf->flow_cfg->nr_flows;
 }
 
+static inline u8 otx2_get_bpid_idx(struct otx2_nic *pfvf, int qidx)
+{
+#ifdef CONFIG_DCB
+	if (pfvf->queue_to_pfc_map)
+		return pfvf->queue_to_pfc_map[qidx];
+#endif
+	return 0;
+}
+
 /* MSI-X APIs */
 void otx2_free_cints(struct otx2_nic *pfvf, int n);
 void otx2_set_cints_affinity(struct otx2_nic *pfvf);
@@ -1223,4 +1257,14 @@ void otx2_dma_unmap_skb_frags(struct otx2_nic *pfvf, struct sg_list *sg);
 int otx2_read_free_sqe(struct otx2_nic *pfvf, u16 qidx);
 void otx2_queue_vf_work(struct mbox *mw, struct workqueue_struct *mbox_wq,
 			int first, int mdevs, u64 intr);
+int otx2_del_mcam_flow_entry(struct otx2_nic *nic, u16 entry,
+			     u16 *cntr_val);
+int otx2_add_mcam_flow_entry(struct otx2_nic *nic,
+			     struct npc_install_flow_req *req);
+int otx2_tc_add_to_flow_list(struct otx2_flow_config *flow_cfg,
+			     struct otx2_tc_flow *node);
+
+struct otx2_tc_flow *
+otx2_tc_get_entry_by_index(struct otx2_flow_config *flow_cfg,
+			   int index);
 #endif /* OTX2_COMMON_H */

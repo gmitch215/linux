@@ -25,7 +25,7 @@
 #include "xfs_iomap.h"
 #include "xfs_reflink.h"
 #include "xfs_file.h"
-#include "xfs_aops.h"
+#include "xfs_ioend.h"
 #include "xfs_zone_alloc.h"
 #include "xfs_error.h"
 #include "xfs_errortag.h"
@@ -129,9 +129,8 @@ xfs_file_fsync(
 	int			datasync)
 {
 	struct xfs_inode	*ip = XFS_I(file->f_mapping->host);
-	struct xfs_mount	*mp = ip->i_mount;
-	int			error, err2;
 	int			log_flushed = 0;
+	int			error;
 
 	trace_xfs_file_fsync(ip);
 
@@ -139,47 +138,35 @@ xfs_file_fsync(
 	if (error)
 		return error;
 
-	if (xfs_is_shutdown(mp))
+	if (xfs_is_shutdown(ip->i_mount))
 		return -EIO;
 
 	xfs_iflags_clear(ip, XFS_ITRUNCATED);
 
 	/*
-	 * If we have an RT and/or log subvolume we need to make sure to flush
-	 * the write cache the device used for file data first.  This is to
-	 * ensure newly written file data make it to disk before logging the new
-	 * inode size in case of an extending write.
-	 */
-	if (XFS_IS_REALTIME_INODE(ip) && mp->m_rtdev_targp != mp->m_ddev_targp)
-		error = blkdev_issue_flush(mp->m_rtdev_targp->bt_bdev);
-	else if (mp->m_logdev_targp != mp->m_ddev_targp)
-		error = blkdev_issue_flush(mp->m_ddev_targp->bt_bdev);
-
-	/*
-	 * If the inode has a inode log item attached, it may need the journal
-	 * flushed to persist any changes the log item might be tracking.
+	 * If the inode has a log item attached, we must force the log up to the
+	 * last LSN in which the inode was modified to ensure all metadata is
+	 * persisted.  The log force will flush the caches for all devices
+	 * before writing the log records unless it is a no-op because there are
+	 * no modifications to this inode that need to be pushed out.
 	 */
 	if (ip->i_itemp) {
-		err2 = xfs_fsync_flush_log(ip, datasync, &log_flushed);
-		if (err2 && !error)
-			error = err2;
+		error = xfs_fsync_flush_log(ip, datasync, &log_flushed);
+		if (error)
+			return error;
 	}
 
 	/*
-	 * If we only have a single device, and the log force about was
-	 * a no-op we might have to flush the data device cache here.
-	 * This can only happen for fdatasync/O_DSYNC if we were overwriting
-	 * an already allocated file and thus do not have any metadata to
-	 * commit.
+	 * If the log force was a no-op, we may still need to flush the
+	 * file data target cache here. This can happen for fdatasync/O_DSYNC
+	 * when no metadata needed to be committed.
+	 *
+	 * Use the inode's actual file data target rather than assuming the
+	 * main data device.
 	 */
-	if (!log_flushed && !XFS_IS_REALTIME_INODE(ip) &&
-	    mp->m_logdev_targp == mp->m_ddev_targp) {
-		err2 = blkdev_issue_flush(mp->m_ddev_targp->bt_bdev);
-		if (err2 && !error)
-			error = err2;
-	}
-
-	return error;
+	if (!log_flushed)
+		return blkdev_issue_flush(xfs_inode_buftarg(ip)->bt_bdev);
+	return 0;
 }
 
 static int
@@ -251,8 +238,6 @@ xfs_file_dio_read(
 	struct iov_iter		*to)
 {
 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
-	unsigned int		dio_flags = 0;
-	const struct iomap_dio_ops *dio_ops = NULL;
 	ssize_t			ret;
 
 	trace_xfs_file_direct_read(iocb, to);
@@ -266,11 +251,15 @@ xfs_file_dio_read(
 	if (ret)
 		return ret;
 	if (mapping_stable_writes(iocb->ki_filp->f_mapping)) {
-		dio_ops = &xfs_dio_read_bounce_ops;
-		dio_flags |= IOMAP_DIO_BOUNCE;
+		ret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops,
+				&xfs_dio_read_bounce_ops, IOMAP_DIO_BOUNCE,
+				NULL, 0);
+	} else {
+		ret = iomap_dio_read_simple(iocb, to, xfs_read_iomap_begin);
+		if (ret == -ENOTBLK)
+			ret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, NULL,
+					0, NULL, 0);
 	}
-	ret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, dio_ops, dio_flags,
-			NULL, 0);
 	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
 
 	return ret;
@@ -560,6 +549,72 @@ xfs_zoned_write_space_reserve(
 			flags, ac);
 }
 
+/*
+ * We need to lock the test/set EOF update as we can be racing with
+ * other IO completions here to update the EOF. Failing to serialise
+ * here can result in EOF moving backwards and Bad Things Happen when
+ * that occurs.
+ *
+ * As IO completion only ever extends EOF, we can do an unlocked check
+ * here to avoid taking the spinlock. If we land within the current EOF,
+ * then we do not need to do an extending update at all, and we don't
+ * need to take the lock to check this. If we race with an update moving
+ * EOF, then we'll either still be beyond EOF and need to take the lock,
+ * or we'll be within EOF and we don't need to take it at all.
+ */
+static int
+xfs_dio_endio_set_isize(
+	struct inode		*inode,
+	loff_t			offset,
+	ssize_t			size)
+{
+	struct xfs_inode	*ip = XFS_I(inode);
+
+	if (offset + size <= i_size_read(inode))
+		return 0;
+
+	spin_lock(&ip->i_flags_lock);
+	if (offset + size <= i_size_read(inode)) {
+		spin_unlock(&ip->i_flags_lock);
+		return 0;
+	}
+
+	i_size_write(inode, offset + size);
+	spin_unlock(&ip->i_flags_lock);
+
+	return xfs_setfilesize(ip, offset, size);
+}
+
+static int
+xfs_zoned_dio_write_end_io(
+	struct kiocb		*iocb,
+	ssize_t			size,
+	int			error,
+	unsigned		flags)
+{
+	struct inode		*inode = file_inode(iocb->ki_filp);
+	struct xfs_inode	*ip = XFS_I(inode);
+	unsigned int		nofs_flag;
+
+	ASSERT(!(flags & (IOMAP_DIO_UNWRITTEN | IOMAP_DIO_COW)));
+
+	trace_xfs_end_io_direct_write(ip, iocb->ki_pos, size);
+
+	if (xfs_is_shutdown(ip->i_mount))
+		return -EIO;
+
+	if (error || !size)
+		return error;
+
+	XFS_STATS_ADD(ip->i_mount, xs_write_bytes, size);
+
+	nofs_flag = memalloc_nofs_save();
+	error = xfs_dio_endio_set_isize(inode, iocb->ki_pos, size);
+	memalloc_nofs_restore(nofs_flag);
+
+	return error;
+}
+
 static int
 xfs_dio_write_end_io(
 	struct kiocb		*iocb,
@@ -572,8 +627,7 @@ xfs_dio_write_end_io(
 	loff_t			offset = iocb->ki_pos;
 	unsigned int		nofs_flag;
 
-	ASSERT(!xfs_is_zoned_inode(ip) ||
-	       !(flags & (IOMAP_DIO_UNWRITTEN | IOMAP_DIO_COW)));
+	ASSERT(!xfs_is_zoned_inode(ip));
 
 	trace_xfs_end_io_direct_write(ip, offset, size);
 
@@ -623,30 +677,8 @@ xfs_dio_write_end_io(
 	 * with the on-disk inode size being outside the in-core inode size. We
 	 * have no other method of updating EOF for AIO, so always do it here
 	 * if necessary.
-	 *
-	 * We need to lock the test/set EOF update as we can be racing with
-	 * other IO completions here to update the EOF. Failing to serialise
-	 * here can result in EOF moving backwards and Bad Things Happen when
-	 * that occurs.
-	 *
-	 * As IO completion only ever extends EOF, we can do an unlocked check
-	 * here to avoid taking the spinlock. If we land within the current EOF,
-	 * then we do not need to do an extending update at all, and we don't
-	 * need to take the lock to check this. If we race with an update moving
-	 * EOF, then we'll either still be beyond EOF and need to take the lock,
-	 * or we'll be within EOF and we don't need to take it at all.
 	 */
-	if (offset + size <= i_size_read(inode))
-		goto out;
-
-	spin_lock(&ip->i_flags_lock);
-	if (offset + size > i_size_read(inode)) {
-		i_size_write(inode, offset + size);
-		spin_unlock(&ip->i_flags_lock);
-		error = xfs_setfilesize(ip, offset, size);
-	} else {
-		spin_unlock(&ip->i_flags_lock);
-	}
+	error = xfs_dio_endio_set_isize(inode, offset, size);
 
 out:
 	memalloc_nofs_restore(nofs_flag);
@@ -688,7 +720,7 @@ xfs_dio_zoned_submit_io(
 static const struct iomap_dio_ops xfs_dio_zoned_write_ops = {
 	.bio_set	= &iomap_ioend_bioset,
 	.submit_io	= xfs_dio_zoned_submit_io,
-	.end_io		= xfs_dio_write_end_io,
+	.end_io		= xfs_zoned_dio_write_end_io,
 };
 
 /*
@@ -814,9 +846,9 @@ retry:
 			NULL, 0);
 
 	/*
-	 * The retry mechanism is based on the ->iomap_begin method returning
+	 * The retry mechanism is based on the ->iomap_next method returning
 	 * -ENOPROTOOPT, which would be when the REQ_ATOMIC-based write is not
-	 * possible. The REQ_ATOMIC-based method typically not be possible if
+	 * possible. The REQ_ATOMIC-based method is typically not possible if
 	 * the write spans multiple extents or the disk blocks are misaligned.
 	 */
 	if (ret == -ENOPROTOOPT && dops == &xfs_direct_write_iomap_ops) {
@@ -1263,6 +1295,23 @@ xfs_falloc_insert_range(
 	if (offset >= isize)
 		return -EINVAL;
 
+	/*
+	 * Let writeback clean up EOF folio state before we bump i_size. The
+	 * insert flushes before it starts shifting and under certain
+	 * circumstances we can write back blocks that should technically be
+	 * considered post-eof (and thus should not be submitted for writeback).
+	 *
+	 * For example, a large, dirty folio that spans EOF and is backed by
+	 * post-eof COW fork preallocation can cause block remap into the data
+	 * fork. This shifts back out beyond EOF, but creates an expectedly
+	 * written post-eof block. The insert is going to flush, unmap and
+	 * cancel prealloc across this whole range, so flush EOF now before we
+	 * bump i_size to provide consistent behavior.
+	 */
+	error = filemap_write_and_wait_range(inode->i_mapping, isize, isize);
+	if (error)
+		return error;
+
 	error = xfs_falloc_setsize(file, isize + len);
 	if (error)
 		return error;
@@ -1308,6 +1357,84 @@ xfs_falloc_force_zero(
 	return XFS_TEST_ERROR(ip->i_mount, XFS_ERRTAG_FORCE_ZERO_RANGE);
 }
 
+static int
+xfs_falloc_write_zeroes(
+	struct file		*file,
+	int			mode,
+	loff_t			offset,
+	loff_t			len,
+	struct xfs_zone_alloc_ctx *ac)
+{
+	struct inode		*inode = file_inode(file);
+	struct xfs_inode	*ip = XFS_I(inode);
+	loff_t			new_size = 0;
+	int			error;
+
+	/*
+	 * XXX: There is an issue with bigrtalloc inodes where there can be blocks
+	 * that are written after the EOF block. This breaks the promise of no
+	 * written blocks past EOF. Return EOPNOTSUPP until it is fixed.
+	 */
+	if (xfs_is_always_cow_inode(ip) || xfs_inode_has_bigrtalloc(ip) ||
+	    !bdev_write_zeroes_unmap_sectors(xfs_inode_buftarg(ip)->bt_bdev))
+		return -EOPNOTSUPP;
+
+	error = xfs_falloc_newsize(file, mode, offset, len, &new_size);
+	if (error)
+		return error;
+
+	/*
+	 *
+	 *    |----------|----------|----------|----------|----------|
+	 *    ^     ^    ^                     ^     ^    ^
+	 *    |     |    |                     |     |    |
+	 *    |   offset |                     |    end   |
+	 *    |          |                     |          |
+	 * offset_rd   offset_ru              end_rd    end_ru
+	 *
+	 * xfs_free_file_space() punches the aligned interior offset_ru -> end_rd
+	 * to holes and byte-zeroes the in-range parts of the partial edge blocks,
+	 * offset -> offset_ru and end_rd -> end.  xfs_zero_range() only touches
+	 * already-written blocks here; it skips holes and unwritten extents, so
+	 * unallocated/unwritten edge blocks are left for the allocation below.
+	 */
+	error = xfs_free_file_space(ip, offset, len, ac);
+	if (error)
+		return error;
+
+	/*
+	 * Publish the new size while the punched range is still a hole, then
+	 * fill it with written zeroes.  Like the other fallocate modes we use
+	 * xfs_falloc_setsize(), but it must run *before* we convert the range
+	 * to written extents: xfs_setattr_size() zeroes [old EOF, new size) via
+	 * xfs_zero_range(), which skips holes, so there is nothing to re-zero.
+	 * It will also writeback partial EOF block before the on-disk size is
+	 * logged.
+	 * Note: extending the size before allocating means a failure below
+	 * leaves the file larger with unallocated holes in the new range.
+	 * That is safe as holes within i_size read back as zeroes and expose
+	 * no stale data while the error is propagated to the caller.
+	 */
+	error = xfs_falloc_setsize(file, new_size);
+	if (error)
+		return error;
+
+	/*
+	 * Allocate written, zeroed extents across the range.  xfs_alloc_file_space()
+	 * rounds outward to block granularity:
+	 *  - holes (the punched interior and any unallocated edge block) are
+	 *    allocated and zeroed;
+	 *  - unwritten extents (including unwritten edge blocks) are converted to
+	 *    written and zeroed;
+	 *  - Already written edge blocks are skipped. The out-of-range bytes of
+	 *    a written edge block keep their data (offset_rd -> offset and
+	 *    end -> end_rd); their in-range bytes (offset -> offset_ru and
+	 *    end_ru -> end were already zeroed by xfs_free_file_space().
+	 */
+	return xfs_alloc_file_space(ip, offset, len,
+			XFS_ALLOC_FILE_SPACE_WRITE_ZEROES);
+}
+
 /*
  * Punch a hole and prealloc the range.  We use a hole punch rather than
  * unwritten extent conversion for two reasons:
@@ -1346,7 +1473,8 @@ xfs_falloc_zero_range(
 		len = round_up(offset + len, blksize) -
 			round_down(offset, blksize);
 		offset = round_down(offset, blksize);
-		error = xfs_alloc_file_space(ip, offset, len);
+		error = xfs_alloc_file_space(ip, offset, len,
+				XFS_ALLOC_FILE_SPACE_PREALLOC);
 	}
 	if (error)
 		return error;
@@ -1372,7 +1500,8 @@ xfs_falloc_unshare_range(
 	if (error)
 		return error;
 
-	error = xfs_alloc_file_space(XFS_I(inode), offset, len);
+	error = xfs_alloc_file_space(XFS_I(inode), offset, len,
+			XFS_ALLOC_FILE_SPACE_PREALLOC);
 	if (error)
 		return error;
 	return xfs_falloc_setsize(file, new_size);
@@ -1400,7 +1529,8 @@ xfs_falloc_allocate_range(
 	if (error)
 		return error;
 
-	error = xfs_alloc_file_space(XFS_I(inode), offset, len);
+	error = xfs_alloc_file_space(XFS_I(inode), offset, len,
+			XFS_ALLOC_FILE_SPACE_PREALLOC);
 	if (error)
 		return error;
 	return xfs_falloc_setsize(file, new_size);
@@ -1410,7 +1540,7 @@ xfs_falloc_allocate_range(
 		(FALLOC_FL_ALLOCATE_RANGE | FALLOC_FL_KEEP_SIZE |	\
 		 FALLOC_FL_PUNCH_HOLE |	FALLOC_FL_COLLAPSE_RANGE |	\
 		 FALLOC_FL_ZERO_RANGE |	FALLOC_FL_INSERT_RANGE |	\
-		 FALLOC_FL_UNSHARE_RANGE)
+		 FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_WRITE_ZEROES)
 
 STATIC long
 __xfs_file_fallocate(
@@ -1461,6 +1591,9 @@ __xfs_file_fallocate(
 		break;
 	case FALLOC_FL_ALLOCATE_RANGE:
 		error = xfs_falloc_allocate_range(file, mode, offset, len);
+		break;
+	case FALLOC_FL_WRITE_ZEROES:
+		error = xfs_falloc_write_zeroes(file, mode, offset, len, ac);
 		break;
 	default:
 		error = -EOPNOTSUPP;

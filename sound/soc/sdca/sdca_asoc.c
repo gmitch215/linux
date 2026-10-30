@@ -160,6 +160,9 @@ static int ge_put_enum_double(struct snd_kcontrol *kcontrol,
 	unsigned int reg = e->reg;
 	int ret;
 
+	if (item[0] >= e->items)
+		return -EINVAL;
+
 	reg &= ~SDW_SDCA_CTL_CSEL(0x3F);
 	reg |= SDW_SDCA_CTL_CSEL(SDCA_CTL_GE_DETECTED_MODE);
 
@@ -359,15 +362,76 @@ static int entity_parse_ot(struct device *dev,
 	return 0;
 }
 
+/**
+ * sdca_asoc_pde_poll_actual_ps - Verify PDE power state reached target state
+ * @regmap: Register map for reading ACTUAL_PS register.
+ * @function_id: SDCA function identifier.
+ * @entity_id: SDCA entity identifier for the power domain.
+ * @from_ps: Source power state (SDCA_PDE_PSn value).
+ * @to_ps: Target power state (SDCA_PDE_PSn value).
+ * @pde_delays: Pointer to array of PDE delay specifications for this device,
+ *              or NULL to use default polling interval.
+ * @num_delays: Number of entries in pde_delays array.
+ *
+ * This function polls the ACTUAL_PS register to verify that a PDE power state
+ * transition has completed. Per SDCA specification, after writing REQUESTED_PS,
+ * the caller must poll ACTUAL_PS until it reflects the requested state.
+ *
+ * This function implements the polling logic but does NOT modify the power state.
+ * The caller is responsible for writing REQUESTED_PS before invoking this function.
+ *
+ * If a delay table is provided, appropriate polling intervals are extracted based
+ * on the from_ps and to_ps transition. If no table is provided or no matching entry
+ * is found, a default polling interval is used.
+ *
+ * Return: Returns zero when ACTUAL_PS reaches the target state, -ETIMEDOUT if the
+ * polling times out before reaching the target state, or a negative error code if
+ * a register read fails.
+ */
+int sdca_asoc_pde_poll_actual_ps(struct regmap *regmap,
+				 int function_id, int entity_id,
+				 int from_ps, int to_ps,
+				 const struct sdca_pde_delay *pde_delays,
+				 int num_delays)
+{
+	static const int polls = 100;
+	static const int default_poll_us = 1000;
+	unsigned int reg, val;
+	int i, poll_us = default_poll_us;
+	int ret;
+
+	if (pde_delays && num_delays > 0) {
+		for (i = 0; i < num_delays; i++) {
+			if (pde_delays[i].from_ps == from_ps && pde_delays[i].to_ps == to_ps) {
+				poll_us = pde_delays[i].us / polls;
+				break;
+			}
+		}
+	}
+
+	reg = SDW_SDCA_CTL(function_id, entity_id, SDCA_CTL_PDE_ACTUAL_PS, 0);
+
+	for (i = 0; i < polls; i++) {
+		if (i)
+			fsleep(poll_us);
+
+		ret = regmap_read(regmap, reg, &val);
+		if (ret)
+			return ret;
+		else if (val == to_ps)
+			return 0;
+	}
+
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_NS(sdca_asoc_pde_poll_actual_ps, "SND_SOC_SDCA");
+
 static int entity_pde_event(struct snd_soc_dapm_widget *widget,
 			    struct snd_kcontrol *kctl, int event)
 {
 	struct snd_soc_component *component = snd_soc_dapm_to_component(widget->dapm);
 	struct sdca_entity *entity = widget->priv;
-	static const int polls = 100;
-	unsigned int reg, val;
-	int from, to, i;
-	int poll_us;
+	int from, to;
 	int ret;
 
 	if (!component)
@@ -386,33 +450,17 @@ static int entity_pde_event(struct snd_soc_dapm_widget *widget,
 		return 0;
 	}
 
-	for (i = 0; i < entity->pde.num_max_delay; i++) {
-		struct sdca_pde_delay *delay = &entity->pde.max_delay[i];
+	ret = sdca_asoc_pde_poll_actual_ps(component->regmap,
+					   SDW_SDCA_CTL_FUNC(widget->reg),
+					   SDW_SDCA_CTL_ENT(widget->reg),
+					   from, to,
+					   entity->pde.max_delay,
+					   entity->pde.num_max_delay);
+	if (ret)
+		dev_err(component->dev, "%s: pde transition %x -> %x failed: %d\n",
+			entity->label, from, to, ret);
 
-		if (delay->from_ps == from && delay->to_ps == to) {
-			poll_us = delay->us / polls;
-			break;
-		}
-	}
-
-	reg = SDW_SDCA_CTL(SDW_SDCA_CTL_FUNC(widget->reg),
-			   SDW_SDCA_CTL_ENT(widget->reg),
-			   SDCA_CTL_PDE_ACTUAL_PS, 0);
-
-	for (i = 0; i < polls; i++) {
-		if (i)
-			fsleep(poll_us);
-
-		ret = regmap_read(component->regmap, reg, &val);
-		if (ret)
-			return ret;
-		else if (val == to)
-			return 0;
-	}
-
-	dev_err(component->dev, "%s: power transition failed: %x\n",
-		entity->label, val);
-	return -ETIMEDOUT;
+	return ret;
 }
 
 static int entity_parse_pde(struct device *dev,
@@ -487,7 +535,7 @@ static int entity_parse_su_device(struct device *dev,
 	if (!range)
 		return -EINVAL;
 
-	(*widget)->id = snd_soc_dapm_mux;
+	(*widget)->id = snd_soc_dapm_mux_named_ctl;
 	(*widget)->kcontrol_news = entity->group->ge.kctl;
 	(*widget)->num_kcontrols = 1;
 	(*widget)++;
@@ -805,6 +853,72 @@ int sdca_asoc_populate_dapm(struct device *dev, struct sdca_function_data *funct
 }
 EXPORT_SYMBOL_NS(sdca_asoc_populate_dapm, "SND_SOC_SDCA");
 
+static int q78_write(struct snd_soc_component *component,
+		     struct soc_mixer_control *mc,
+		     unsigned int reg, const int val)
+{
+	unsigned int mask = GENMASK(mc->sign_bit, 0);
+	unsigned int reg_val;
+
+	if (val < 0 || val > mc->max - mc->min)
+		return -EINVAL;
+
+	reg_val = (val + mc->min) * mc->shift;
+
+	return snd_soc_component_update_bits(component, reg, mask, reg_val);
+}
+
+int sdca_asoc_q78_put_volsw(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_value *ucontrol)
+{
+	struct soc_mixer_control *mc = (struct soc_mixer_control *)kcontrol->private_value;
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	int ret;
+
+	ret = q78_write(component, mc, mc->reg, ucontrol->value.integer.value[0]);
+	if (ret < 0)
+		return ret;
+
+	if (snd_soc_volsw_is_stereo(mc)) {
+		int err; /* Don't drop change flag */
+
+		err = q78_write(component, mc, mc->rreg, ucontrol->value.integer.value[1]);
+		if (err)
+			return err;
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_NS(sdca_asoc_q78_put_volsw, "SND_SOC_SDCA");
+
+static int q78_read(struct snd_soc_component *component,
+		    struct soc_mixer_control *mc, unsigned int reg)
+{
+	unsigned int reg_val;
+	int val;
+
+	reg_val = snd_soc_component_read(component, reg);
+
+	val = (sign_extend32(reg_val, mc->sign_bit) / (int)mc->shift) - mc->min;
+
+	return val & GENMASK(mc->sign_bit, 0);
+}
+
+int sdca_asoc_q78_get_volsw(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_value *ucontrol)
+{
+	struct soc_mixer_control *mc = (struct soc_mixer_control *)kcontrol->private_value;
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+
+	ucontrol->value.integer.value[0] = q78_read(component, mc, mc->reg);
+
+	if (snd_soc_volsw_is_stereo(mc))
+		ucontrol->value.integer.value[1] = q78_read(component, mc, mc->rreg);
+
+	return 0;
+}
+EXPORT_SYMBOL_NS(sdca_asoc_q78_get_volsw, "SND_SOC_SDCA");
+
 static int control_limit_kctl(struct device *dev,
 			      struct sdca_entity *entity,
 			      struct sdca_control *control,
@@ -841,16 +955,15 @@ static int control_limit_kctl(struct device *dev,
 	tlv[2] = (min * 100) >> 8;
 	tlv[3] = (max * 100) >> 8;
 
-	step = (step * 100) >> 8;
-
-	mc->min = ((int)tlv[2] / step);
-	mc->max = ((int)tlv[3] / step);
+	mc->min = min / step;
+	mc->max = max / step;
 	mc->shift = step;
 	mc->sign_bit = 15;
-	mc->sdca_q78 = 1;
 
 	kctl->tlv.p = tlv;
 	kctl->access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
+	kctl->get = sdca_asoc_q78_get_volsw;
+	kctl->put = sdca_asoc_q78_put_volsw;
 
 	return 0;
 }
@@ -1117,7 +1230,7 @@ static u64 width_find_mask(unsigned int bits)
 	}
 }
 
-static int populate_rate_format(struct device *dev,
+int sdca_asoc_populate_rate_format(struct device *dev,
 				struct sdca_function_data *function,
 				struct sdca_entity *entity,
 				struct snd_soc_pcm_stream *stream)
@@ -1178,6 +1291,7 @@ static int populate_rate_format(struct device *dev,
 
 	return 0;
 }
+EXPORT_SYMBOL_NS(sdca_asoc_populate_rate_format, "SND_SOC_SDCA");
 
 /**
  * sdca_asoc_populate_dais - fill in an array of DAI drivers for a Function
@@ -1230,7 +1344,7 @@ int sdca_asoc_populate_dais(struct device *dev, struct sdca_function_data *funct
 		stream->channels_min = 1;
 		stream->channels_max = SDCA_MAX_CHANNEL_COUNT;
 
-		ret = populate_rate_format(dev, function, entity, stream);
+		ret = sdca_asoc_populate_rate_format(dev, function, entity, stream);
 		if (ret)
 			return ret;
 

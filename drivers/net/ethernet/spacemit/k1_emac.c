@@ -57,7 +57,6 @@
 
 struct desc_buf {
 	u64 dma_addr;
-	void *buff_addr;
 	u16 dma_len;
 	u8 map_as_page;
 };
@@ -70,7 +69,6 @@ struct emac_tx_desc_buffer {
 struct emac_rx_desc_buffer {
 	struct sk_buff *skb;
 	u64 dma_addr;
-	void *buff_addr;
 	u16 dma_len;
 	u8 map_as_page;
 };
@@ -340,7 +338,6 @@ static void emac_free_tx_buf(struct emac_priv *priv, int i)
 
 		buf->dma_addr = 0;
 		buf->map_as_page = false;
-		buf->buff_addr = NULL;
 	}
 
 	if (tx_buf->skb) {
@@ -805,6 +802,9 @@ err_free_skb:
 	i = old_head;
 	while (i != head) {
 		emac_free_tx_buf(priv, i);
+
+		tx_desc_addr = &((struct emac_desc *)tx_ring->desc_addr)[i];
+		memset(tx_desc_addr, 0, sizeof(*tx_desc_addr));
 
 		if (++i == tx_ring->total_cnt)
 			i = 0;

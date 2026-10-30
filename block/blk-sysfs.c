@@ -19,6 +19,7 @@
 #include "blk-wbt.h"
 #include "blk-cgroup.h"
 #include "blk-throttle.h"
+#include "error-injection.h"
 
 struct queue_sysfs_entry {
 	struct attribute attr;
@@ -581,27 +582,27 @@ static int queue_wc_store(struct gendisk *disk, const char *page,
 	return 0;
 }
 
-#define QUEUE_RO_ENTRY(_prefix, _name)			\
-static struct queue_sysfs_entry _prefix##_entry = {	\
-	.attr	= { .name = _name, .mode = 0444 },	\
-	.show	= _prefix##_show,			\
+#define QUEUE_RO_ENTRY(_prefix, _name)				\
+static const struct queue_sysfs_entry _prefix##_entry = {	\
+	.attr	= { .name = _name, .mode = 0444 },		\
+	.show	= _prefix##_show,				\
 };
 
-#define QUEUE_RW_ENTRY(_prefix, _name)			\
-static struct queue_sysfs_entry _prefix##_entry = {	\
-	.attr	= { .name = _name, .mode = 0644 },	\
-	.show	= _prefix##_show,			\
-	.store	= _prefix##_store,			\
+#define QUEUE_RW_ENTRY(_prefix, _name)				\
+static const struct queue_sysfs_entry _prefix##_entry = {	\
+	.attr	= { .name = _name, .mode = 0644 },		\
+	.show	= _prefix##_show,				\
+	.store	= _prefix##_store,				\
 };
 
 #define QUEUE_LIM_RO_ENTRY(_prefix, _name)			\
-static struct queue_sysfs_entry _prefix##_entry = {	\
+static const struct queue_sysfs_entry _prefix##_entry = {	\
 	.attr		= { .name = _name, .mode = 0444 },	\
 	.show_limit	= _prefix##_show,			\
 }
 
 #define QUEUE_LIM_RW_ENTRY(_prefix, _name)			\
-static struct queue_sysfs_entry _prefix##_entry = {	\
+static const struct queue_sysfs_entry _prefix##_entry = {	\
 	.attr		= { .name = _name, .mode = 0644 },	\
 	.show_limit	= _prefix##_show,			\
 	.store_limit	= _prefix##_store,			\
@@ -665,7 +666,7 @@ QUEUE_LIM_RO_ENTRY(queue_virt_boundary_mask, "virt_boundary_mask");
 QUEUE_LIM_RO_ENTRY(queue_dma_alignment, "dma_alignment");
 
 /* legacy alias for logical_block_size: */
-static struct queue_sysfs_entry queue_hw_sector_size_entry = {
+static const struct queue_sysfs_entry queue_hw_sector_size_entry = {
 	.attr		= {.name = "hw_sector_size", .mode = 0444 },
 	.show_limit	= queue_logical_block_size_show,
 };
@@ -731,7 +732,7 @@ QUEUE_RW_ENTRY(queue_wb_lat, "wbt_lat_usec");
 #endif
 
 /* Common attributes for bio-based and request-based queues. */
-static struct attribute *queue_attrs[] = {
+static const struct attribute *const queue_attrs[] = {
 	/*
 	 * Attributes which are protected with q->limits_lock.
 	 */
@@ -791,7 +792,7 @@ static struct attribute *queue_attrs[] = {
 };
 
 /* Request-based queue attributes that are not relevant for bio-based queues. */
-static struct attribute *blk_mq_queue_attrs[] = {
+static const struct attribute *const blk_mq_queue_attrs[] = {
 	/*
 	 * Attributes which require some form of locking other than
 	 * q->sysfs_lock.
@@ -811,7 +812,7 @@ static struct attribute *blk_mq_queue_attrs[] = {
 	NULL,
 };
 
-static umode_t queue_attr_visible(struct kobject *kobj, struct attribute *attr,
+static umode_t queue_attr_visible(struct kobject *kobj, const struct attribute *attr,
 				int n)
 {
 	struct gendisk *disk = container_of(kobj, struct gendisk, queue_kobj);
@@ -827,7 +828,7 @@ static umode_t queue_attr_visible(struct kobject *kobj, struct attribute *attr,
 }
 
 static umode_t blk_mq_queue_attr_visible(struct kobject *kobj,
-					 struct attribute *attr, int n)
+					 const struct attribute *attr, int n)
 {
 	struct gendisk *disk = container_of(kobj, struct gendisk, queue_kobj);
 	struct request_queue *q = disk->queue;
@@ -841,17 +842,17 @@ static umode_t blk_mq_queue_attr_visible(struct kobject *kobj,
 	return attr->mode;
 }
 
-static struct attribute_group queue_attr_group = {
-	.attrs = queue_attrs,
-	.is_visible = queue_attr_visible,
+static const struct attribute_group queue_attr_group = {
+	.attrs_const = queue_attrs,
+	.is_visible_const = queue_attr_visible,
 };
 
-static struct attribute_group blk_mq_queue_attr_group = {
-	.attrs = blk_mq_queue_attrs,
-	.is_visible = blk_mq_queue_attr_visible,
+static const struct attribute_group blk_mq_queue_attr_group = {
+	.attrs_const = blk_mq_queue_attrs,
+	.is_visible_const = blk_mq_queue_attr_visible,
 };
 
-#define to_queue(atr) container_of((atr), struct queue_sysfs_entry, attr)
+#define to_queue(atr) container_of_const((atr), struct queue_sysfs_entry, attr)
 
 static ssize_t
 queue_attr_show(struct kobject *kobj, struct attribute *attr, char *page)
@@ -933,6 +934,8 @@ static void blk_debugfs_remove(struct gendisk *disk)
 
 	blk_debugfs_lock_nomemsave(q);
 	blk_trace_shutdown(q);
+	if (IS_ENABLED(CONFIG_BLK_ERROR_INJECTION))
+		blk_error_injection_exit(disk);
 	debugfs_remove_recursive(q->debugfs_dir);
 	q->debugfs_dir = NULL;
 	q->sched_debugfs_dir = NULL;
@@ -963,9 +966,19 @@ int blk_register_queue(struct gendisk *disk)
 
 	memflags = blk_debugfs_lock(q);
 	q->debugfs_dir = debugfs_create_dir(disk->disk_name, blk_debugfs_root);
+	if (IS_ENABLED(CONFIG_BLK_ERROR_INJECTION))
+		blk_error_injection_init(disk);
 	if (queue_is_mq(q))
 		blk_mq_debugfs_register(q);
 	blk_debugfs_unlock(q, memflags);
+
+	/*
+	 * For blk-mq rotational zoned devices, default to using QD=1
+	 * writes. For non-mq rotational zoned devices, the device driver can
+	 * set an appropriate default.
+	 */
+	if (queue_is_mq(q) && blk_queue_rot(q) && blk_queue_is_zoned(q))
+		blk_queue_flag_set(QUEUE_FLAG_ZONED_QD1_WRITES, q);
 
 	ret = disk_register_independent_access_ranges(disk);
 	if (ret)

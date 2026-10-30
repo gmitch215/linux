@@ -14,7 +14,7 @@ struct task_struct __current;
 
 struct vm_area_struct *alloc_vma(struct mm_struct *mm,
 		unsigned long start, unsigned long end,
-		pgoff_t pgoff, vm_flags_t vm_flags)
+		pgoff_t pgoff, vma_flags_t vma_flags)
 {
 	struct vm_area_struct *vma = vm_area_alloc(mm);
 
@@ -23,8 +23,9 @@ struct vm_area_struct *alloc_vma(struct mm_struct *mm,
 
 	vma->vm_start = start;
 	vma->vm_end = end;
-	vma->vm_pgoff = pgoff;
-	vm_flags_reset(vma, vm_flags);
+	vma_set_pgoff(vma, pgoff);
+	vma_set_anon_pgoff(vma, start >> PAGE_SHIFT);
+	vma->flags = vma_flags;
 	vma_assert_detached(vma);
 
 	return vma;
@@ -38,9 +39,9 @@ void detach_free_vma(struct vm_area_struct *vma)
 
 struct vm_area_struct *alloc_and_link_vma(struct mm_struct *mm,
 		unsigned long start, unsigned long end,
-		pgoff_t pgoff, vm_flags_t vm_flags)
+		pgoff_t pgoff, vma_flags_t vma_flags)
 {
-	struct vm_area_struct *vma = alloc_vma(mm, start, end, pgoff, vm_flags);
+	struct vm_area_struct *vma = alloc_vma(mm, start, end, pgoff, vma_flags);
 
 	if (vma == NULL)
 		return NULL;
@@ -119,13 +120,4 @@ struct task_struct *get_current(void)
 unsigned long rlimit(unsigned int limit)
 {
 	return (unsigned long)-1;
-}
-
-void vma_set_range(struct vm_area_struct *vma,
-		   unsigned long start, unsigned long end,
-		   pgoff_t pgoff)
-{
-	vma->vm_start = start;
-	vma->vm_end = end;
-	vma->vm_pgoff = pgoff;
 }

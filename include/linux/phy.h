@@ -23,7 +23,7 @@
 #include <linux/module.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
-#include <linux/mod_devicetable.h>
+#include <linux/device-id/mdio.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/irqreturn.h>
 #include <linux/iopoll.h>
@@ -612,6 +612,8 @@ struct phy_oatc14_sqi_capability {
  * @advertising_eee: Currently advertised EEE linkmodes
  * @enable_tx_lpi: When True, MAC should transmit LPI to PHY
  * @eee_active: phylib private state, indicating that EEE has been negotiated
+ * @autonomous_eee_disabled: Set when autonomous EEE has been disabled,
+ *	used to re-apply after PHY soft reset
  * @eee_cfg: User configuration of EEE
  * @lp_advertising: Current link partner advertised linkmodes
  * @host_interfaces: PHY interface modes supported by host
@@ -739,6 +741,7 @@ struct phy_device {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(eee_disabled_modes);
 	bool enable_tx_lpi;
 	bool eee_active;
+	bool autonomous_eee_disabled;
 	struct eee_config eee_cfg;
 
 	/* Host supported PHY interface types. Should be ignored if empty. */
@@ -1358,6 +1361,17 @@ struct phy_driver {
 	/** @get_stats: Return the statistic counter values */
 	void (*get_stats)(struct phy_device *dev,
 			  struct ethtool_stats *stats, u64 *data);
+
+	/**
+	 * @disable_autonomous_eee: Disable PHY-autonomous EEE
+	 *
+	 * Some PHYs manage EEE autonomously, preventing the MAC from
+	 * controlling LPI signaling. This callback disables autonomous
+	 * EEE at the PHY.
+	 *
+	 * Return: 0 on success, negative errno on failure.
+	 */
+	int (*disable_autonomous_eee)(struct phy_device *dev);
 
 	/* Get and Set PHY tunables */
 	/** @get_tunable: Return the value of a tunable */
@@ -2152,8 +2166,6 @@ int phy_suspend(struct phy_device *phydev);
 int phy_resume(struct phy_device *phydev);
 int __phy_resume(struct phy_device *phydev);
 int phy_loopback(struct phy_device *phydev, bool enable, int speed);
-struct phy_device *phy_attach(struct net_device *dev, const char *bus_id,
-			      phy_interface_t interface);
 struct phy_device *phy_find_next(struct mii_bus *bus, struct phy_device *pos);
 int phy_attach_direct(struct net_device *dev, struct phy_device *phydev,
 		      u32 flags, phy_interface_t interface);
@@ -2217,6 +2229,11 @@ int phy_start_cable_test_tdr(struct phy_device *phydev,
 static inline void phy_device_reset(struct phy_device *phydev, int value)
 {
 	mdio_device_reset(&phydev->mdio, value);
+}
+
+static inline bool phy_device_has_reset(struct phy_device *phydev)
+{
+	return mdiodev_has_reset(&phydev->mdio);
 }
 
 #define phydev_err(_phydev, format, args...)	\
@@ -2285,6 +2302,9 @@ static inline int genphy_no_config_intr(struct phy_device *phydev)
 {
 	return 0;
 }
+int genphy_read_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum);
+int genphy_write_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum,
+			 u16 val);
 int genphy_read_mmd_unsupported(struct phy_device *phdev, int devad,
 				u16 regnum);
 int genphy_write_mmd_unsupported(struct phy_device *phdev, int devnum,
@@ -2297,6 +2317,7 @@ int genphy_c37_read_status(struct phy_device *phydev, bool *changed);
 /* Clause 45 PHY */
 int genphy_c45_restart_aneg(struct phy_device *phydev);
 int genphy_c45_check_and_restart_aneg(struct phy_device *phydev, bool restart);
+int genphy_c45_pma_soft_reset(struct phy_device *phydev);
 int genphy_c45_aneg_done(struct phy_device *phydev);
 int genphy_c45_read_link(struct phy_device *phydev);
 int genphy_c45_read_lpa(struct phy_device *phydev);
@@ -2447,9 +2468,6 @@ int __phy_hwtstamp_set(struct phy_device *phydev,
 		       struct netlink_ext_ack *extack);
 
 struct phy_port *phy_get_sfp_port(struct phy_device *phydev);
-
-extern const struct bus_type mdio_bus_type;
-extern const struct class mdio_bus_class;
 
 /**
  * phy_module_driver() - Helper macro for registering PHY drivers

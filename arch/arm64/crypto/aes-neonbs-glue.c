@@ -17,6 +17,7 @@
 
 MODULE_AUTHOR("Ard Biesheuvel <ard.biesheuvel@linaro.org>");
 MODULE_DESCRIPTION("Bit sliced AES using NEON instructions");
+MODULE_IMPORT_NS("CRYPTO_INTERNAL");
 MODULE_LICENSE("GPL v2");
 
 MODULE_ALIAS_CRYPTO("ecb(aes)");
@@ -42,20 +43,6 @@ asmlinkage void aesbs_xts_encrypt(u8 out[], u8 const in[], u8 const rk[],
 asmlinkage void aesbs_xts_decrypt(u8 out[], u8 const in[], u8 const rk[],
 				  int rounds, int blocks, u8 iv[]);
 
-/* borrowed from aes-neon-blk.ko */
-asmlinkage void neon_aes_ecb_encrypt(u8 out[], u8 const in[], u32 const rk[],
-				     int rounds, int blocks);
-asmlinkage void neon_aes_cbc_encrypt(u8 out[], u8 const in[], u32 const rk[],
-				     int rounds, int blocks, u8 iv[]);
-asmlinkage void neon_aes_ctr_encrypt(u8 out[], u8 const in[], u32 const rk[],
-				     int rounds, int bytes, u8 ctr[]);
-asmlinkage void neon_aes_xts_encrypt(u8 out[], u8 const in[],
-				     u32 const rk1[], int rounds, int bytes,
-				     u32 const rk2[], u8 iv[], int first);
-asmlinkage void neon_aes_xts_decrypt(u8 out[], u8 const in[],
-				     u32 const rk1[], int rounds, int bytes,
-				     u32 const rk2[], u8 iv[], int first);
-
 struct aesbs_ctx {
 	u8	rk[13 * (8 * AES_BLOCK_SIZE) + 32];
 	int	rounds;
@@ -79,7 +66,7 @@ static int aesbs_setkey(struct crypto_skcipher *tfm, const u8 *in_key,
 	struct crypto_aes_ctx *rk;
 	int err;
 
-	rk = kmalloc(sizeof(*rk), GFP_KERNEL);
+	rk = kmalloc_obj(*rk);
 	if (!rk)
 		return -ENOMEM;
 
@@ -141,7 +128,7 @@ static int aesbs_cbc_ctr_setkey(struct crypto_skcipher *tfm, const u8 *in_key,
 	struct crypto_aes_ctx *rk;
 	int err;
 
-	rk = kmalloc(sizeof(*rk), GFP_KERNEL);
+	rk = kmalloc_obj(*rk);
 	if (!rk)
 		return -ENOMEM;
 

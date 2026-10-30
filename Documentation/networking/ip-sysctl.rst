@@ -202,6 +202,24 @@ neigh/default/gc_thresh3 - INTEGER
 
 	Default: 1024
 
+neigh/default/gc_interval - INTEGER
+	Specifies how often the garbage collector for neighbor entries
+	should run. This value applies to the entire table, not
+	individual entries. Unused since kernel v2.6.8.
+
+	Default: 30 seconds
+
+neigh/default/gc_stale_time - INTEGER
+	Determines how long a neighbor entry can remain unused before it is
+	considered stale and eligible for garbage collection. Entries that have
+	not been used for longer than this time will be removed by the garbage
+	collector, unless they have active references, are marked as PERMANENT,
+	or carry the NTF_EXT_LEARNED or NTF_EXT_VALIDATED flag. Stale entries
+	are only removed by the periodic GC when there are at least gc_thresh1
+	neighbors in the table.
+
+	Default: 60 seconds
+
 neigh/default/unres_qlen_bytes - INTEGER
 	The maximum number of bytes which may be used by packets
 	queued for each	unresolved address by other network layers.
@@ -230,7 +248,7 @@ neigh/default/unres_qlen - INTEGER
 
 neigh/default/interval_probe_time_ms - INTEGER
 	The probe interval for neighbor entries with NTF_MANAGED flag,
-	the min value is 1.
+	the min value is 1, and the max value is 86400000 (1 day).
 
 	Default: 5000
 
@@ -471,7 +489,7 @@ tcp_ecn - INTEGER
 tcp_ecn_option - INTEGER
 	Control Accurate ECN (AccECN) option sending when AccECN has been
 	successfully negotiated during handshake. Send logic inhibits
-	sending AccECN options regarless of this setting when no AccECN
+	sending AccECN options regardless of this setting when no AccECN
 	option has been seen for the reverse direction.
 
 	Possible values are:
@@ -855,6 +873,8 @@ tcp_rmem - vector of 3 INTEGERs: min, default, max
 	automatic tuning of that socket's receive buffer size, in which
 	case this value is ignored.
 	Default: between 131072 and 32MB, depending on RAM size.
+
+	Each of the three values cannot be set below 4096.
 
 tcp_sack - BOOLEAN
 	Enable select acknowledgments (SACKS).
@@ -1612,6 +1632,22 @@ ip_local_reserved_ports - list of comma separated ranges
 
 	Default: Empty
 
+ip_local_port_step_width - INTEGER
+        Defines the numerical maximum increment between successive port
+        allocations within the ephemeral port range when an unavailable port is
+        reached. This can be used to mitigate accumulated nodes in port
+        distribution when reserved ports have been configured. Please note that
+        port collisions may be more frequent in a system with a very high load.
+
+        It is recommended to set this value strictly larger than the largest
+        contiguous block of ports configure in ip_local_reserved_ports. For
+        large reserved port ranges, setting this to 3x or 4x the size of the
+        largest block is advised. Using a value equal or greater than the local
+        port range size completely solves the uneven port distribution problem,
+        but it can degrade performance under port exhaustion situations.
+
+        Default: 0 (disabled)
+
 ip_unprivileged_port_start - INTEGER
 	This is a per-namespace sysctl.  It defines the first
 	unprivileged port in the network namespace.  Privileged ports
@@ -1747,14 +1783,14 @@ icmp_msgs_per_sec - INTEGER
 	controlled by this limit. For security reasons, the precise count
 	of messages per second is randomized.
 
-	Default: 1000
+	Default: 10000
 
 icmp_msgs_burst - INTEGER
 	icmp_msgs_per_sec controls number of ICMP packets sent per second,
-	while icmp_msgs_burst controls the burst size of these packets.
+	while icmp_msgs_burst controls the token bucket size.
 	For security reasons, the precise burst size is randomized.
 
-	Default: 50
+	Default: 10000
 
 icmp_ratemask - INTEGER
 	Mask made of ICMP types for which rates are being limited.
@@ -2410,7 +2446,11 @@ fib_multipath_hash_policy - INTEGER
 
 	Possible values:
 
-	- 0 - Layer 3 (source and destination addresses plus flow label)
+	- 0 - Layer 3 (source and destination addresses plus flow label).
+	  For IPv6 TCP, the local ECMP path is selected from the socket
+	  txhash rather than the flow label, and may change after a TCP
+	  rehash event (such as a retransmission timeout) to recover from
+	  path failure.  The on-wire flow label is unaffected.
 	- 1 - Layer 4 (standard 5-tuple)
 	- 2 - Layer 3 or inner Layer 3 if present
 	- 3 - Custom multipath hash. Fields used for multipath hash calculation

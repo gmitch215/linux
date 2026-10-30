@@ -110,7 +110,6 @@ static const struct amdgpu_hwip_reg_entry sdma_reg_list_7_1[] = {
 
 static void sdma_v7_1_set_ring_funcs(struct amdgpu_device *adev);
 static void sdma_v7_1_set_buffer_funcs(struct amdgpu_device *adev);
-static void sdma_v7_1_set_vm_pte_funcs(struct amdgpu_device *adev);
 static void sdma_v7_1_set_irq_funcs(struct amdgpu_device *adev);
 static int sdma_v7_1_inst_start(struct amdgpu_device *adev,
 				uint32_t inst_mask);
@@ -332,7 +331,7 @@ static void sdma_v7_1_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 se
 	amdgpu_ring_write(ring, SDMA_PKT_COPY_LINEAR_HEADER_OP(SDMA_OP_FENCE) |
 			  SDMA_PKT_FENCE_HEADER_MTYPE(0x3)); /* Ucached(UC) */
 	/* zero in first two bits */
-	BUG_ON(addr & 0x3);
+	WARN_ON(addr & 0x3);
 	amdgpu_ring_write(ring, lower_32_bits(addr));
 	amdgpu_ring_write(ring, upper_32_bits(addr));
 	amdgpu_ring_write(ring, lower_32_bits(seq));
@@ -343,7 +342,7 @@ static void sdma_v7_1_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 se
 		amdgpu_ring_write(ring, SDMA_PKT_COPY_LINEAR_HEADER_OP(SDMA_OP_FENCE) |
 				  SDMA_PKT_FENCE_HEADER_MTYPE(0x3));
 		/* zero in first two bits */
-		BUG_ON(addr & 0x3);
+		WARN_ON(addr & 0x3);
 		amdgpu_ring_write(ring, lower_32_bits(addr));
 		amdgpu_ring_write(ring, upper_32_bits(addr));
 		amdgpu_ring_write(ring, upper_32_bits(seq));
@@ -776,23 +775,6 @@ static int sdma_v7_1_soft_reset(struct amdgpu_ip_block *ip_block)
 	return sdma_v7_1_inst_start(adev, inst_mask);
 }
 
-static bool sdma_v7_1_check_soft_reset(struct amdgpu_ip_block *ip_block)
-{
-	struct amdgpu_device *adev = ip_block->adev;
-	struct amdgpu_ring *ring;
-	int i, r;
-	long tmo = msecs_to_jiffies(1000);
-
-	for (i = 0; i < adev->sdma.num_instances; i++) {
-		ring = &adev->sdma.instance[i].ring;
-		r = amdgpu_ring_test_ib(ring, tmo);
-		if (r)
-			return true;
-	}
-
-	return false;
-}
-
 static int sdma_v7_1_reset_queue(struct amdgpu_ring *ring,
 				 unsigned int vmid,
 				 struct amdgpu_fence *timedout_fence)
@@ -933,7 +915,7 @@ static int sdma_v7_1_ring_test_ring(struct amdgpu_ring *ring)
 
 	tmp = 0xCAFEDEAD;
 
-	r = amdgpu_device_wb_get(adev, &index);
+	r = amdgpu_wb_get(adev, &index);
 	if (r) {
 		dev_err(adev->dev, "(%d) failed to allocate wb slot\n", r);
 		return r;
@@ -945,7 +927,7 @@ static int sdma_v7_1_ring_test_ring(struct amdgpu_ring *ring)
 	r = amdgpu_ring_alloc(ring, 5);
 	if (r) {
 		DRM_ERROR("amdgpu: dma failed to lock ring %d (%d).\n", ring->idx, r);
-		amdgpu_device_wb_free(adev, index);
+		amdgpu_wb_free(adev, index);
 		return r;
 	}
 
@@ -970,7 +952,7 @@ static int sdma_v7_1_ring_test_ring(struct amdgpu_ring *ring)
 	if (i >= adev->usec_timeout)
 		r = -ETIMEDOUT;
 
-	amdgpu_device_wb_free(adev, index);
+	amdgpu_wb_free(adev, index);
 
 	return r;
 }
@@ -997,7 +979,7 @@ static int sdma_v7_1_ring_test_ib(struct amdgpu_ring *ring, long timeout)
 	tmp = 0xCAFEDEAD;
 	memset(&ib, 0, sizeof(ib));
 
-	r = amdgpu_device_wb_get(adev, &index);
+	r = amdgpu_wb_get(adev, &index);
 	if (r) {
 		dev_err(adev->dev, "(%ld) failed to allocate wb slot\n", r);
 		return r;
@@ -1048,7 +1030,7 @@ err1:
 	amdgpu_ib_free(&ib, NULL);
 	dma_fence_put(f);
 err0:
-	amdgpu_device_wb_free(adev, index);
+	amdgpu_wb_free(adev, index);
 	return r;
 }
 
@@ -1130,12 +1112,21 @@ static void sdma_v7_1_vm_set_pte_pde(struct amdgpu_ib *ib,
 	/* for physically contiguous pages (vram) */
 	u32 header = SDMA_PKT_COPY_LINEAR_HEADER_OP(SDMA_OP_PTEPDE);
 
-	if (amdgpu_mtype_local)
-		header |= SDMA_PKT_PTEPDE_COPY_HEADER_MTYPE(0x3);
-	else
-		header |= (SDMA_PKT_PTEPDE_COPY_HEADER_MTYPE(0x2) |
-			   SDMA_PKT_PTEPDE_COPY_HEADER_SNOOP(0x1) |
-			   SDMA_PKT_PTEPDE_COPY_HEADER_SCOPE(0x3));
+	/* TODO:
+	 * When VM_L2_CNTL5.WALKER_FETCH_PDE_MTYPE_ENABLE is enabled, change below MTYPE
+	 * to RW for AID A1 and UC for AID A0. NC needs additional GCR flush and need not
+	 * be supported. Also, honour amdgpu_mtype_local override. RW would additionally
+	 * require setting SCOPE bits in the header.
+	 *
+	 * header |= (SDMA_PKT_PTEPDE_COPY_HEADER_MTYPE(0x2:RW) |
+	 *           SDMA_PKT_PTEPDE_COPY_HEADER_SNOOP(0x1) |
+	 *           SDMA_PKT_PTEPDE_COPY_HEADER_SCOPE(0x3:SYS_SCOPE));
+	 */
+
+	/* VM_L2_CNTL5.WALKER_FETCH_PDE_MTYPE_ENABLE is 0 which defaults to UC. So,
+	 * use MTYPE_UC (0x3). For ref. MTYPE_RW=0x2 MTYPE_NC=0x0
+	 */
+	header |= SDMA_PKT_PTEPDE_COPY_HEADER_MTYPE(0x3) | SDMA_PKT_PTEPDE_COPY_HEADER_SNOOP(0x1);
 
 	ib->ptr[ib->length_dw++] = header;
 	ib->ptr[ib->length_dw++] = lower_32_bits(pe); /* dst addr */
@@ -1248,10 +1239,29 @@ static void sdma_v7_1_ring_emit_reg_write_reg_wait(struct amdgpu_ring *ring,
 	amdgpu_ring_emit_reg_wait(ring, reg1, mask, mask);
 }
 
+static const struct amdgpu_vm_pte_funcs sdma_v7_1_vm_pte_funcs = {
+	.copy_pte_num_dw = 8,
+	.copy_pte = sdma_v7_1_vm_copy_pte,
+	.write_pte = sdma_v7_1_vm_write_pte,
+	.set_pte_pde = sdma_v7_1_vm_set_pte_pde,
+};
+
 static int sdma_v7_1_early_init(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
 	int r;
+
+	switch (amdgpu_user_queue) {
+	case -1:
+	default:
+		adev->sdma.no_user_submission = true;
+		adev->sdma.disable_uq = true;
+		break;
+	case 0:
+		adev->sdma.no_user_submission = false;
+		adev->sdma.disable_uq = true;
+		break;
+	}
 
 	r = amdgpu_sdma_init_microcode(adev, 0, true);
 	if (r) {
@@ -1260,8 +1270,7 @@ static int sdma_v7_1_early_init(struct amdgpu_ip_block *ip_block)
 	}
 
 	sdma_v7_1_set_ring_funcs(adev);
-	sdma_v7_1_set_buffer_funcs(adev);
-	sdma_v7_1_set_vm_pte_funcs(adev);
+	amdgpu_sdma_set_vm_pte_scheds(adev, &sdma_v7_1_vm_pte_funcs);
 	sdma_v7_1_set_irq_funcs(adev);
 	sdma_v7_1_set_mqd_funcs(adev);
 
@@ -1289,6 +1298,7 @@ static int sdma_v7_1_sw_init(struct amdgpu_ip_block *ip_block)
 		ring->ring_obj = NULL;
 		ring->use_doorbell = true;
 		ring->me = i;
+		ring->no_user_submission = adev->sdma.no_user_submission;
 
 		for (xcc_id = 0; xcc_id < fls(adev->gfx.xcc_mask); xcc_id++) {
 			if (adev->sdma.instance[i].xcc_id == GET_INST(GC, xcc_id))
@@ -1329,10 +1339,6 @@ static int sdma_v7_1_sw_init(struct amdgpu_ip_block *ip_block)
 	else
 		DRM_ERROR("Failed to allocated memory for SDMA IP Dump\n");
 
-#ifdef CONFIG_DRM_AMDGPU_NAVI3X_USERQ
-	adev->userq_funcs[AMDGPU_HW_IP_DMA] = &userq_mes_funcs;
-#endif
-
 	return r;
 }
 
@@ -1359,10 +1365,16 @@ static int sdma_v7_1_hw_init(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
 	uint32_t inst_mask;
+	int r;
 
 	inst_mask = GENMASK(adev->sdma.num_instances - 1, 0);
 
-	return sdma_v7_1_inst_start(adev, inst_mask);
+	r = sdma_v7_1_inst_start(adev, inst_mask);
+	if (r)
+		return r;
+	sdma_v7_1_set_buffer_funcs(adev);
+
+	return 0;
 }
 
 static int sdma_v7_1_hw_fini(struct amdgpu_ip_block *ip_block)
@@ -1611,7 +1623,6 @@ const struct amd_ip_funcs sdma_v7_1_ip_funcs = {
 	.is_idle = sdma_v7_1_is_idle,
 	.wait_for_idle = sdma_v7_1_wait_for_idle,
 	.soft_reset = sdma_v7_1_soft_reset,
-	.check_soft_reset = sdma_v7_1_check_soft_reset,
 	.set_clockgating_state = sdma_v7_1_set_clockgating_state,
 	.set_powergating_state = sdma_v7_1_set_powergating_state,
 	.get_clockgating_state = sdma_v7_1_get_clockgating_state,
@@ -1739,37 +1750,17 @@ static void sdma_v7_1_emit_fill_buffer(struct amdgpu_ib *ib,
 }
 
 static const struct amdgpu_buffer_funcs sdma_v7_1_buffer_funcs = {
-	.copy_max_bytes = 0x400000,
+	.copy_max_bytes = 1 << 30,
 	.copy_num_dw = 8,
 	.emit_copy_buffer = sdma_v7_1_emit_copy_buffer,
-	.fill_max_bytes = 0x400000,
+	.fill_max_bytes = 1 << 30,
 	.fill_num_dw = 5,
 	.emit_fill_buffer = sdma_v7_1_emit_fill_buffer,
 };
 
 static void sdma_v7_1_set_buffer_funcs(struct amdgpu_device *adev)
 {
-	adev->mman.buffer_funcs = &sdma_v7_1_buffer_funcs;
-	adev->mman.buffer_funcs_ring = &adev->sdma.instance[0].ring;
-}
-
-static const struct amdgpu_vm_pte_funcs sdma_v7_1_vm_pte_funcs = {
-	.copy_pte_num_dw = 8,
-	.copy_pte = sdma_v7_1_vm_copy_pte,
-	.write_pte = sdma_v7_1_vm_write_pte,
-	.set_pte_pde = sdma_v7_1_vm_set_pte_pde,
-};
-
-static void sdma_v7_1_set_vm_pte_funcs(struct amdgpu_device *adev)
-{
-	unsigned i;
-
-	adev->vm_manager.vm_pte_funcs = &sdma_v7_1_vm_pte_funcs;
-	for (i = 0; i < adev->sdma.num_instances; i++) {
-		adev->vm_manager.vm_pte_scheds[i] =
-			&adev->sdma.instance[i].ring.sched;
-	}
-	adev->vm_manager.vm_pte_num_scheds = adev->sdma.num_instances;
+	amdgpu_sdma_set_buffer_funcs_scheds(adev, &sdma_v7_1_buffer_funcs);
 }
 
 const struct amdgpu_ip_block_version sdma_v7_1_ip_block = {

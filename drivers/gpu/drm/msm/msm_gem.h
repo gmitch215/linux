@@ -68,6 +68,9 @@ struct msm_gem_vm {
 	/** @base: Inherit from drm_gpuvm. */
 	struct drm_gpuvm base;
 
+	/** @rcu: RCU-delayed free so an exported sched fence->sched stays valid. */
+	struct rcu_head rcu;
+
 	/**
 	 * @sched: Scheduler used for asynchronous VM_BIND request.
 	 *
@@ -296,13 +299,14 @@ int msm_gem_cpu_fini(struct drm_gem_object *obj);
 int msm_gem_new_handle(struct drm_device *dev, struct drm_file *file,
 		size_t size, uint32_t flags, uint32_t *handle, char *name);
 struct drm_gem_object *msm_gem_new(struct drm_device *dev,
-		size_t size, uint32_t flags);
+		size_t size, uint32_t flags, struct drm_gem_object *r_obj);
 void *msm_gem_kernel_new(struct drm_device *dev, size_t size, uint32_t flags,
 			 struct drm_gpuvm *vm, struct drm_gem_object **bo,
 			 uint64_t *iova);
 void msm_gem_kernel_put(struct drm_gem_object *bo, struct drm_gpuvm *vm);
 struct drm_gem_object *msm_gem_import(struct drm_device *dev,
-		struct dma_buf *dmabuf, struct sg_table *sgt);
+				      struct dma_buf_attachment *attach,
+				      struct sg_table *sgt);
 __printf(2, 3)
 void msm_gem_object_set_name(struct drm_gem_object *bo, const char *fmt, ...);
 
@@ -452,6 +456,7 @@ struct msm_gem_submit {
 	bool bos_pinned : 1;
 	bool fault_dumped:1;/* Limit devcoredump dumping to one per submit */
 	bool in_rb : 1;     /* "sudo" mode, copy cmds into RB */
+	bool has_exec : 1;  /* @exec is initialized. */
 	struct msm_ringbuffer *ring;
 	unsigned int nr_cmds;
 	unsigned int nr_bos;

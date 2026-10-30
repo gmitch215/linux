@@ -9,7 +9,6 @@
 #include <linux/fsnotify.h>
 #include <linux/poll.h>
 #include <linux/nospec.h>
-#include <linux/compat.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/indirect_call_wrapper.h>
 
@@ -50,33 +49,20 @@ static bool io_file_supports_nowait(struct io_kiocb *req, __poll_t mask)
 	return false;
 }
 
-static int io_iov_compat_buffer_select_prep(struct io_rw *rw)
-{
-	struct compat_iovec __user *uiov = u64_to_user_ptr(rw->addr);
-	struct compat_iovec iov;
-
-	if (copy_from_user(&iov, uiov, sizeof(iov)))
-		return -EFAULT;
-	rw->len = iov.iov_len;
-	return 0;
-}
-
 static int io_iov_buffer_select_prep(struct io_kiocb *req)
 {
 	struct iovec __user *uiov;
-	struct iovec iov;
+	struct iovec fast_iov, *iov;
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 
 	if (rw->len != 1)
 		return -EINVAL;
 
-	if (io_is_compat(req->ctx))
-		return io_iov_compat_buffer_select_prep(rw);
-
 	uiov = u64_to_user_ptr(rw->addr);
-	if (copy_from_user(&iov, uiov, sizeof(*uiov)))
-		return -EFAULT;
-	rw->len = iov.iov_len;
+	iov = iovec_from_user(uiov, 1, 1, &fast_iov, io_is_compat(req->ctx));
+	if (IS_ERR(iov))
+		return PTR_ERR(iov);
+	rw->len = iov->iov_len;
 	return 0;
 }
 
@@ -230,7 +216,7 @@ static inline void io_meta_restore(struct io_async_rw *io, struct kiocb *kiocb)
 }
 
 static int io_prep_rw_pi(struct io_kiocb *req, struct io_rw *rw, int ddir,
-			 u64 attr_ptr, u64 attr_type_mask)
+			 u64 attr_ptr)
 {
 	struct io_uring_attr_pi pi_attr;
 	struct io_async_rw *io;
@@ -305,7 +291,7 @@ static int __io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe,
 			return -EINVAL;
 
 		attr_ptr = READ_ONCE(sqe->attr_ptr);
-		return io_prep_rw_pi(req, rw, ddir, attr_ptr, attr_type_mask);
+		return io_prep_rw_pi(req, rw, ddir, attr_ptr);
 	}
 	return 0;
 }
@@ -504,7 +490,7 @@ static bool io_rw_should_reissue(struct io_kiocb *req)
 	if (!S_ISBLK(mode) && !S_ISREG(mode))
 		return false;
 	if ((req->flags & REQ_F_NOWAIT) || (io_wq_current_is_worker() &&
-	    !(ctx->flags & IORING_SETUP_IOPOLL)))
+	    !(req->flags & REQ_F_IOPOLL)))
 		return false;
 	/*
 	 * If ref is dying, we might be running poll reap from the exit work.
@@ -531,20 +517,25 @@ static void io_req_end_write(struct io_kiocb *req)
 	}
 }
 
-/*
- * Trigger the notifications after having done some IO, and finish the write
- * accounting, if any.
- */
+/* Trigger the notifications after having done some IO. */
+static void io_req_io_notify(struct io_kiocb *req)
+{
+	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+
+	if (rw->kiocb.ki_flags & IOCB_WRITE)
+		fsnotify_modify(req->file);
+	else
+		fsnotify_access(req->file);
+}
+
+/* Finish write accounting and notify, for inline completions only. */
 static void io_req_io_end(struct io_kiocb *req)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 
-	if (rw->kiocb.ki_flags & IOCB_WRITE) {
+	if (rw->kiocb.ki_flags & IOCB_WRITE)
 		io_req_end_write(req);
-		fsnotify_modify(req->file);
-	} else {
-		fsnotify_access(req->file);
-	}
+	io_req_io_notify(req);
 }
 
 static void __io_complete_rw_common(struct io_kiocb *req, long res)
@@ -577,10 +568,10 @@ void io_req_rw_complete(struct io_tw_req tw_req, io_tw_token_t tw)
 {
 	struct io_kiocb *req = tw_req.req;
 
-	io_req_io_end(req);
+	io_req_io_notify(req);
 
 	if (req->flags & (REQ_F_BUFFER_SELECTED|REQ_F_BUFFER_RING))
-		req->cqe.flags |= io_put_kbuf(req, req->cqe.res, NULL);
+		req->cqe.flags |= io_put_kbuf(req, max(req->cqe.res, 0), NULL);
 
 	io_req_rw_cleanup(req, 0);
 	io_req_task_complete(tw_req, tw);
@@ -590,6 +581,10 @@ static void io_complete_rw(struct kiocb *kiocb, long res)
 {
 	struct io_rw *rw = container_of(kiocb, struct io_rw, kiocb);
 	struct io_kiocb *req = cmd_to_io_kiocb(rw);
+
+	/* ring owner may block in freeze_super() before task_work runs */
+	if (kiocb->ki_flags & IOCB_WRITE)
+		io_req_end_write(req);
 
 	__io_complete_rw_common(req, res);
 	io_req_set_res(req, io_fixup_rw_res(req, res), 0);
@@ -601,18 +596,36 @@ static void io_complete_rw_iopoll(struct kiocb *kiocb, long res)
 {
 	struct io_rw *rw = container_of(kiocb, struct io_rw, kiocb);
 	struct io_kiocb *req = cmd_to_io_kiocb(rw);
+	int final_res = io_fixup_rw_res(req, res);
 
 	if (kiocb->ki_flags & IOCB_WRITE)
 		io_req_end_write(req);
-	if (unlikely(res != req->cqe.res)) {
-		if (res == -EAGAIN && io_rw_should_reissue(req))
-			req->flags |= REQ_F_REISSUE | REQ_F_BL_NO_RECYCLE;
-		else
-			req->cqe.res = res;
-	}
+
+	if (res == -EAGAIN && io_rw_should_reissue(req))
+		req->flags |= REQ_F_REISSUE | REQ_F_BL_NO_RECYCLE;
+	else if (unlikely(final_res != req->cqe.res))
+		req->cqe.res = final_res;
 
 	/* order with io_iopoll_complete() checking ->iopoll_completed */
 	smp_store_release(&req->iopoll_completed, 1);
+}
+
+static inline ssize_t io_fixup_restart_res(ssize_t ret)
+{
+	switch (ret) {
+	case -ERESTARTSYS:
+	case -ERESTARTNOINTR:
+	case -ERESTARTNOHAND:
+	case -ERESTART_RESTARTBLOCK:
+		/*
+		 * We can't just restart the syscall, since previously
+		 * submitted sqes may already be in progress. Just fail
+		 * this IO with EINTR.
+		 */
+		return -EINTR;
+	default:
+		return ret;
+	}
 }
 
 static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
@@ -624,23 +637,10 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		return;
 
 	/* transform internal restart error codes */
-	if (unlikely(ret < 0)) {
-		switch (ret) {
-		case -ERESTARTSYS:
-		case -ERESTARTNOINTR:
-		case -ERESTARTNOHAND:
-		case -ERESTART_RESTARTBLOCK:
-			/*
-			 * We can't just restart the syscall, since previously
-			 * submitted sqes may already be in progress. Just fail
-			 * this IO with EINTR.
-			 */
-			ret = -EINTR;
-			break;
-		}
-	}
+	if (unlikely(ret < 0))
+		ret = io_fixup_restart_res(ret);
 
-	if (req->ctx->flags & IORING_SETUP_IOPOLL)
+	if (req->flags & REQ_F_IOPOLL)
 		io_complete_rw_iopoll(&rw->kiocb, ret);
 	else
 		io_complete_rw(&rw->kiocb, ret);
@@ -654,7 +654,7 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
 
 	if (ret >= 0 && req->flags & REQ_F_CUR_POS)
 		req->file->f_pos = rw->kiocb.ki_pos;
-	if (ret >= 0 && !(req->ctx->flags & IORING_SETUP_IOPOLL)) {
+	if (ret >= 0 && !(req->flags & REQ_F_IOPOLL)) {
 		u32 cflags = 0;
 
 		__io_complete_rw_common(req, ret);
@@ -876,9 +876,11 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
 	if (ctx->flags & IORING_SETUP_IOPOLL) {
 		if (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll)
 			return -EOPNOTSUPP;
+		req->flags |= REQ_F_IOPOLL;
 		kiocb->private = NULL;
 		kiocb->ki_flags |= IOCB_HIPRI;
 		req->iopoll_completed = 0;
+		req->cqe.flags = 0;
 		if (ctx->flags & IORING_SETUP_HYBRID_IOPOLL) {
 			/* make sure every req only blocks once*/
 			req->flags &= ~REQ_F_IOPOLL_STATE;
@@ -899,7 +901,7 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
 		 * We have a union of meta fields with wpq used for buffered-io
 		 * in io_async_rw, so fail it here.
 		 */
-		if (!(req->file->f_flags & O_DIRECT))
+		if (!(file->f_flags & O_DIRECT))
 			return -EOPNOTSUPP;
 		kiocb->ki_flags |= IOCB_HAS_METADATA;
 		kiocb->private = &io->meta;
@@ -961,13 +963,13 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (ret == -EAGAIN) {
 		/* If we can poll, just do that. */
 		if (io_file_can_poll(req))
-			return -EAGAIN;
+			return ret;
 		/* IOPOLL retry should happen for io-wq threads */
-		if (!force_nonblock && !(req->ctx->flags & IORING_SETUP_IOPOLL))
-			goto done;
+		if (!force_nonblock && !(req->flags & REQ_F_IOPOLL))
+			return ret;
 		/* no retry on NONBLOCK nor RWF_NOWAIT */
 		if (req->flags & REQ_F_NOWAIT)
-			goto done;
+			return ret;
 		ret = 0;
 	} else if (ret == -EIOCBQUEUED) {
 		return IOU_ISSUE_SKIP_COMPLETE;
@@ -975,7 +977,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 		   (req->flags & REQ_F_NOWAIT) || !need_complete_io(req) ||
 		   (issue_flags & IO_URING_F_MULTISHOT)) {
 		/* read all, failed, already did sync or don't want to retry */
-		goto done;
+		return ret;
 	}
 
 	/*
@@ -1018,8 +1020,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 		kiocb->ki_flags &= ~IOCB_WAITQ;
 		iov_iter_restore(&io->iter, &io->iter_state);
 	} while (ret > 0);
-done:
-	/* it's faster to check here than delegate to kfree */
+
 	return ret;
 }
 
@@ -1034,7 +1035,8 @@ int io_read(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (req->flags & REQ_F_BUFFERS_COMMIT)
 		io_kbuf_recycle(req, sel.buf_list, issue_flags);
-	return ret;
+
+	return io_fixup_restart_res(ret);
 }
 
 int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags)
@@ -1068,8 +1070,10 @@ int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags)
 		return IOU_RETRY;
 	} else if (ret <= 0) {
 		io_kbuf_recycle(req, sel.buf_list, issue_flags);
-		if (ret < 0)
+		if (ret < 0) {
+			ret = io_fixup_restart_res(ret);
 			req_set_fail(req);
+		}
 	} else if (!(req->flags & REQ_F_APOLL_MULTISHOT)) {
 		cflags = io_put_kbuf(req, ret, sel.buf_list);
 	} else {
@@ -1188,7 +1192,7 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		goto done;
 	if (!force_nonblock || ret2 != -EAGAIN) {
 		/* IOPOLL retry should happen for io-wq threads */
-		if (ret2 == -EAGAIN && (req->ctx->flags & IORING_SETUP_IOPOLL))
+		if (ret2 == -EAGAIN && (req->flags & REQ_F_IOPOLL))
 			goto ret_eagain;
 
 		if (ret2 != req->cqe.res && ret2 >= 0 && need_complete_io(req)) {
@@ -1379,7 +1383,7 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
 		list_del(&req->iopoll_node);
 		wq_list_add_tail(&req->comp_list, &ctx->submit_state.compl_reqs);
 		nr_events++;
-		req->cqe.flags = io_put_kbuf(req, req->cqe.res, NULL);
+		req->cqe.flags |= io_put_kbuf(req, max(req->cqe.res, 0), NULL);
 		if (!io_is_uring_cmd(req))
 			io_req_rw_cleanup(req, 0);
 	}

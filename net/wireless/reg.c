@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright 2002-2005, Instant802 Networks, Inc.
  * Copyright 2005-2006, Devicescape Software, Inc.
@@ -6,18 +7,6 @@
  * Copyright 2013-2014  Intel Mobile Communications GmbH
  * Copyright      2017  Intel Deutschland GmbH
  * Copyright (C) 2018 - 2026 Intel Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 
@@ -2356,8 +2345,20 @@ static bool reg_wdev_chan_valid(struct wiphy *wiphy, struct wireless_dev *wdev)
 	iftype = wdev->iftype;
 
 	/* make sure the interface is active */
-	if (!wdev->netdev || !netif_running(wdev->netdev))
+	if (!wdev_running(wdev))
 		return true;
+
+	/* NAN doesn't have links, handle it separately */
+	if (iftype == NL80211_IFTYPE_NAN) {
+		for (int i = 0; i < wdev->u.nan.n_channels; i++) {
+			ret = cfg80211_reg_can_beacon(wiphy,
+						      &wdev->u.nan.chandefs[i],
+						      NL80211_IFTYPE_NAN);
+			if (!ret)
+				return false;
+		}
+		return true;
+	}
 
 	for (link = 0; link < ARRAY_SIZE(wdev->links); link++) {
 		struct ieee80211_channel *chan;
@@ -2408,8 +2409,11 @@ static bool reg_wdev_chan_valid(struct wiphy *wiphy, struct wireless_dev *wdev)
 				continue;
 			chandef = wdev->u.ocb.chandef;
 			break;
-		case NL80211_IFTYPE_NAN:
-			/* we have no info, but NAN is also pretty universal */
+		case NL80211_IFTYPE_NAN_DATA:
+			/* NAN channels are checked in NL80211_IFTYPE_NAN interface */
+			break;
+		case NL80211_IFTYPE_PD:
+			/* we have no info, but PD is also pretty universal */
 			continue;
 		default:
 			/* others not implemented for now */
@@ -2442,16 +2446,52 @@ static bool reg_wdev_chan_valid(struct wiphy *wiphy, struct wireless_dev *wdev)
 	return true;
 }
 
-static void reg_leave_invalid_chans(struct wiphy *wiphy)
+void reg_leave_invalid_nan_wk(struct work_struct *work)
 {
+	struct cfg80211_registered_device *rdev;
 	struct wireless_dev *wdev;
-	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
 
-	guard(wiphy)(wiphy);
+	rdev = container_of(work, struct cfg80211_registered_device,
+			    reg_leave_nan_wk);
 
-	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list)
-		if (!reg_wdev_chan_valid(wiphy, wdev))
+	/* stopping NAN closes its data interfaces, which needs the RTNL */
+	rtnl_lock();
+
+	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
+		bool valid;
+
+		if (wdev->iftype != NL80211_IFTYPE_NAN)
+			continue;
+
+		scoped_guard(wiphy, &rdev->wiphy)
+			valid = reg_wdev_chan_valid(&rdev->wiphy, wdev);
+		if (!valid)
 			cfg80211_leave(rdev, wdev, -1);
+	}
+
+	rtnl_unlock();
+}
+
+void reg_leave_invalid_chans_wk(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+	struct wireless_dev *wdev;
+
+	lockdep_assert_held(&wiphy->mtx);
+
+	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
+		if (reg_wdev_chan_valid(wiphy, wdev))
+			continue;
+
+		/*
+		 * Tearing down NAN needs the RTNL for closing NAN_DATA
+		 * interfaces, handle that separately.
+		 */
+		if (wdev->iftype == NL80211_IFTYPE_NAN)
+			schedule_work(&rdev->reg_leave_nan_wk);
+		else
+			cfg80211_leave_locked(rdev, wdev, -1);
+	}
 }
 
 static void reg_check_chans_work(struct work_struct *work)
@@ -2459,12 +2499,13 @@ static void reg_check_chans_work(struct work_struct *work)
 	struct cfg80211_registered_device *rdev;
 
 	pr_debug("Verifying active interfaces after reg change\n");
-	rtnl_lock();
 
-	for_each_rdev(rdev)
-		reg_leave_invalid_chans(&rdev->wiphy);
+	rcu_read_lock();
 
-	rtnl_unlock();
+	list_for_each_entry_rcu(rdev, &cfg80211_rdev_list, list)
+		wiphy_work_queue(&rdev->wiphy, &rdev->reg_check_chans_wk);
+
+	rcu_read_unlock();
 }
 
 void reg_check_channels(void)
@@ -3785,7 +3826,8 @@ static void print_regdomain(const struct ieee80211_regdomain *rd)
 		}
 	}
 
-	pr_debug(" DFS Master region: %s", reg_dfs_region_str(rd->dfs_region));
+	pr_debug(" DFS Master region: %s\n",
+		 reg_dfs_region_str(rd->dfs_region));
 	print_rd_rules(rd);
 }
 

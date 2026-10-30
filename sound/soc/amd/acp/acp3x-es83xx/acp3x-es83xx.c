@@ -11,7 +11,6 @@
 #include <sound/jack.h>
 #include <sound/soc-acpi.h>
 #include <linux/clk.h>
-#include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/i2c.h>
@@ -380,6 +379,14 @@ static const struct dmi_system_id acp3x_es83xx_dmi_table[] = {
 			DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "HUAWEI"),
 			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "HVY-WXX9"),
 			DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "M1040"),
+		},
+		.driver_data = (void *)(ES83XX_ENABLE_DMIC),
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "HUAWEI"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "HVY-WXX9"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "M1060"),
 		},
 		.driver_data = (void *)(ES83XX_ENABLE_DMIC),
 	},

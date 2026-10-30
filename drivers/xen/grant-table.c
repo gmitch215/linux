@@ -59,6 +59,7 @@
 #include <xen/swiotlb-xen.h>
 #include <xen/balloon.h>
 #ifdef CONFIG_X86
+#include <asm/cpuid/api.h>
 #include <asm/xen/cpuid.h>
 #endif
 #include <xen/mem-reservation.h>
@@ -1405,7 +1406,7 @@ static int gnttab_map_frames_v2(xen_pfn_t *frames, unsigned int nr_gframes)
 	/* No need for kzalloc as it is initialized in following hypercall
 	 * GNTTABOP_get_status_frames.
 	 */
-	sframes = kmalloc_array(nr_sframes, sizeof(uint64_t), GFP_ATOMIC);
+	sframes = kmalloc_array(nr_sframes, sizeof(*sframes), GFP_ATOMIC);
 	if (!sframes)
 		return -ENOMEM;
 
@@ -1477,7 +1478,7 @@ static int gnttab_map(unsigned int start_idx, unsigned int end_idx)
 	/* No need for kzalloc as it is initialized in following hypercall
 	 * GNTTABOP_setup_table.
 	 */
-	frames = kmalloc_array(nr_gframes, sizeof(unsigned long), GFP_ATOMIC);
+	frames = kmalloc_objs(*frames, nr_gframes, GFP_ATOMIC);
 	if (!frames)
 		return -ENOMEM;
 
@@ -1579,7 +1580,7 @@ static int gnttab_setup(void)
 	}
 	return gnttab_map(0, nr_grant_frames - 1);
 }
-
+#ifdef CONFIG_HIBERNATE_CALLBACKS
 int gnttab_resume(void)
 {
 	gnttab_request_version();
@@ -1592,6 +1593,7 @@ int gnttab_suspend(void)
 		gnttab_interface->unmap_frames();
 	return 0;
 }
+#endif
 
 static int gnttab_expand(unsigned int req_entries)
 {

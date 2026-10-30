@@ -15,6 +15,7 @@
 
 #include "instructions/xe_mi_commands.h"
 #include "xe_configfs.h"
+#include "xe_defaults.h"
 #include "xe_gt_types.h"
 #include "xe_hw_engine_types.h"
 #include "xe_module.h"
@@ -236,6 +237,18 @@
  *
  * This setting only takes effect when probing the device.
  *
+ * Enable multi-queue
+ * ------------------
+ *
+ * Multi-queue support on the device is enabled by default where the
+ * hardware supports it. Writing 0 force-disables multi-queue support:
+ * multi-queue exec-queue group creation via ioctl is refused, and the
+ * GuC feature is disabled::
+ *
+ *	# echo 0 > /sys/kernel/config/xe/0000:03:00.0/enable_multi_queue
+ *
+ * This attribute can only be set before binding to the device.
+ *
  * Remove devices
  * ==============
  *
@@ -261,8 +274,10 @@ struct xe_config_group_device {
 		struct wa_bb ctx_restore_mid_bb[XE_ENGINE_CLASS_MAX];
 		bool survivability_mode;
 		bool enable_psmi;
+		bool enable_multi_queue;
 		struct {
 			unsigned int max_vfs;
+			bool admin_only_pf;
 		} sriov;
 	} config;
 
@@ -279,8 +294,10 @@ static const struct xe_config_device device_defaults = {
 	.engines_allowed = U64_MAX,
 	.survivability_mode = false,
 	.enable_psmi = false,
+	.enable_multi_queue = true,
 	.sriov = {
-		.max_vfs = UINT_MAX,
+		.max_vfs = XE_DEFAULT_MAX_VFS,
+		.admin_only_pf = XE_DEFAULT_ADMIN_ONLY_PF,
 	},
 };
 
@@ -572,6 +589,33 @@ static ssize_t enable_psmi_store(struct config_item *item, const char *page, siz
 	return len;
 }
 
+static ssize_t enable_multi_queue_show(struct config_item *item, char *page)
+{
+	struct xe_config_device *dev = to_xe_config_device(item);
+
+	return sprintf(page, "%d\n", dev->enable_multi_queue);
+}
+
+static ssize_t enable_multi_queue_store(struct config_item *item, const char *page,
+					size_t len)
+{
+	struct xe_config_group_device *dev = to_xe_config_group_device(item);
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&dev->lock);
+	if (is_bound(dev))
+		return -EBUSY;
+
+	dev->config.enable_multi_queue = val;
+
+	return len;
+}
+
 static bool wa_bb_read_advance(bool dereference, char **p,
 			       const char *append, size_t len,
 			       size_t *max_size)
@@ -809,6 +853,7 @@ static ssize_t ctx_restore_post_bb_store(struct config_item *item,
 
 CONFIGFS_ATTR(, ctx_restore_mid_bb);
 CONFIGFS_ATTR(, ctx_restore_post_bb);
+CONFIGFS_ATTR(, enable_multi_queue);
 CONFIGFS_ATTR(, enable_psmi);
 CONFIGFS_ATTR(, engines_allowed);
 CONFIGFS_ATTR(, gt_types_allowed);
@@ -817,6 +862,7 @@ CONFIGFS_ATTR(, survivability_mode);
 static struct configfs_attribute *xe_config_device_attrs[] = {
 	&attr_ctx_restore_mid_bb,
 	&attr_ctx_restore_post_bb,
+	&attr_enable_multi_queue,
 	&attr_enable_psmi,
 	&attr_engines_allowed,
 	&attr_gt_types_allowed,
@@ -897,10 +943,40 @@ static ssize_t sriov_max_vfs_store(struct config_item *item, const char *page, s
 	return len;
 }
 
+static ssize_t sriov_admin_only_pf_show(struct config_item *item, char *page)
+{
+	struct xe_config_group_device *dev = to_xe_config_group_device(item->ci_parent);
+
+	guard(mutex)(&dev->lock);
+
+	return sprintf(page, "%s\n", str_yes_no(dev->config.sriov.admin_only_pf));
+}
+
+static ssize_t sriov_admin_only_pf_store(struct config_item *item, const char *page, size_t len)
+{
+	struct xe_config_group_device *dev = to_xe_config_group_device(item->ci_parent);
+	bool admin_only_pf;
+	int ret;
+
+	guard(mutex)(&dev->lock);
+
+	if (is_bound(dev))
+		return -EBUSY;
+
+	ret = kstrtobool(page, &admin_only_pf);
+	if (ret)
+		return ret;
+
+	dev->config.sriov.admin_only_pf = admin_only_pf;
+	return len;
+}
+
 CONFIGFS_ATTR(sriov_, max_vfs);
+CONFIGFS_ATTR(sriov_, admin_only_pf);
 
 static struct configfs_attribute *xe_config_sriov_attrs[] = {
 	&sriov_attr_max_vfs,
+	&sriov_attr_admin_only_pf,
 	NULL,
 };
 
@@ -910,6 +986,8 @@ static bool xe_config_sriov_is_visible(struct config_item *item,
 	struct xe_config_group_device *dev = to_xe_config_group_device(item->ci_parent);
 
 	if (attr == &sriov_attr_max_vfs && dev->mode != XE_SRIOV_MODE_PF)
+		return false;
+	if (attr == &sriov_attr_admin_only_pf && dev->mode != XE_SRIOV_MODE_PF)
 		return false;
 
 	return true;
@@ -1062,8 +1140,10 @@ static void dump_custom_dev_config(struct pci_dev *pdev,
 
 	PRI_CUSTOM_ATTR("%llx", gt_types_allowed);
 	PRI_CUSTOM_ATTR("%llx", engines_allowed);
+	PRI_CUSTOM_ATTR("%d", enable_multi_queue);
 	PRI_CUSTOM_ATTR("%d", enable_psmi);
 	PRI_CUSTOM_ATTR("%d", survivability_mode);
+	PRI_CUSTOM_ATTR("%u", sriov.admin_only_pf);
 
 #undef PRI_CUSTOM_ATTR
 }
@@ -1190,6 +1270,27 @@ bool xe_configfs_get_psmi_enabled(struct pci_dev *pdev)
 }
 
 /**
+ * xe_configfs_get_enable_multi_queue - get configfs enable_multi_queue setting
+ * @pdev: pci device
+ *
+ * Return: true if multi-queue is enabled for this device (the default),
+ * false if it has been force-disabled via configfs.
+ */
+bool xe_configfs_get_enable_multi_queue(struct pci_dev *pdev)
+{
+	struct xe_config_group_device *dev = find_xe_config_group_device(pdev);
+	bool ret;
+
+	if (!dev)
+		return true;
+
+	ret = dev->config.enable_multi_queue;
+	config_group_put(&dev->group);
+
+	return ret;
+}
+
+/**
  * xe_configfs_get_ctx_restore_mid_bb - get configfs ctx_restore_mid_bb setting
  * @pdev: pci device
  * @class: hw engine class
@@ -1242,6 +1343,32 @@ u32 xe_configfs_get_ctx_restore_post_bb(struct pci_dev *pdev,
 }
 
 #ifdef CONFIG_PCI_IOV
+/**
+ * xe_configfs_admin_only_pf() - Get PF's operational mode.
+ * @pdev: the &pci_dev device
+ *
+ * Find the configfs group that belongs to the PCI device and return a flag
+ * whether the PF driver should be dedicated for VFs management only.
+ *
+ * If configfs group is not present, use driver's default value.
+ *
+ * Return: true if PF driver is dedicated for VFs administration only.
+ */
+bool xe_configfs_admin_only_pf(struct pci_dev *pdev)
+{
+	struct xe_config_group_device *dev = find_xe_config_group_device(pdev);
+	bool admin_only_pf;
+
+	if (!dev)
+		return XE_DEFAULT_ADMIN_ONLY_PF;
+
+	scoped_guard(mutex, &dev->lock)
+		admin_only_pf = dev->config.sriov.admin_only_pf;
+
+	config_group_put(&dev->group);
+
+	return admin_only_pf;
+}
 /**
  * xe_configfs_get_max_vfs() - Get number of VFs that could be managed
  * @pdev: the &pci_dev device

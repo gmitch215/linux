@@ -21,7 +21,7 @@ const char help_fmt[] =
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-S STRIDE]\n"
+"Usage: %s [-S STRIDE] [-v]\n"
 "\n"
 "  -S STRIDE     Override CPU pair stride (default: nr_cpus_ids / 2)\n"
 "  -v            Print libbpf debug messages\n"
@@ -190,7 +190,7 @@ restart:
 	ecode = UEI_REPORT(skel, uei);
 	scx_pair__destroy(skel);
 
-	if (UEI_ECODE_RESTART(ecode))
+	if (!exit_req && UEI_ECODE_RESTART(ecode))
 		goto restart;
 	return 0;
 }
