@@ -5,9 +5,6 @@
 #include <linux/memblock.h>
 #include <asm/page.h>
 
-unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)] __page_aligned_bss;
-EXPORT_SYMBOL(empty_zero_page);
-
 void __init arch_zone_limits_init(unsigned long *max_zone_pfns)
 {
 	/* Initialize zones, so that memory can be allocated beyond bootmem. */

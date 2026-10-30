@@ -37,8 +37,12 @@ static inline void _exception_exit(struct pt_regs *regs)
 										\
 		if (user_mode(regs)) {						\
 			do {							\
-				syscall = syscall_enter_from_user_mode(		\
-					regs, syscall);				\
+				enter_from_user_mode(regs);			\
+				instrumentation_begin();			\
+				local_irq_enable();				\
+				if (!syscall_enter_from_user_mode_work(regs, &syscall)) \
+					syscall = -1;				\
+				instrumentation_end();				\
 										\
 				if (syscall >= 0 && syscall < __NR_syscalls) {	\
 					fn = sys_call_table[syscall];		\

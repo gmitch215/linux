@@ -11,7 +11,7 @@ SYSCALL_DEFINE3(wasm32_truncate64, const char __user *, pathname,
 
 SYSCALL_DEFINE3(wasm32_ftruncate64, unsigned int, fd, sc_arg_u64_dual(length))
 {
-	return ksys_ftruncate(fd, sc_arg_u64_glue(length));
+	return ksys_ftruncate(fd, sc_arg_u64_glue(length), FTRUNCATE_LFS);
 }
 
 SYSCALL_DEFINE5(wasm32_pread64, unsigned int, fd, char __user *, buf,

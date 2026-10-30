@@ -34,11 +34,4 @@
 extern void paging_init(void);
 #define swapper_pg_dir ((pgd_t *) 0)
 
-/*
- * ZERO_PAGE is a global shared page that is always zero: used
- * for zero-mapped memory areas etc..
- */
-extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
-#define ZERO_PAGE(vaddr) (virt_to_page(empty_zero_page))
-
 #endif /* _ASM_WASM_PGTABLE_H */
